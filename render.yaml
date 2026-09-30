@@ -1,0 +1,12 @@
+# Pubblicazione gratuita su https://render.com (link fisso https, sempre raggiungibile)
+services:
+  - type: web
+    name: radio-udine-rp
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /api/info
+    envVars:
+      - key: SERVER_PASSWORD
+        sync: false

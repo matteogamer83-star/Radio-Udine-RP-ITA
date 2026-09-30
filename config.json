@@ -1,0 +1,32 @@
+{
+  "nomeServer": "Udine RP ITA",
+  "porta": 3000,
+  "passwordServer": "",
+  "durataMassimaTrasmissione": 60,
+  "messaggiVocaliSalvati": 20,
+
+  "canali": [
+    { "id": "generale",       "nome": "Generale",               "icona": "📻", "descrizione": "Canale libero per tutti",                  "password": "" },
+    { "id": "centrale",       "nome": "Centrale Operativa 112", "icona": "🚨", "descrizione": "Coordinamento emergenze e forze dell'ordine", "password": "" },
+    { "id": "polizia",        "nome": "Polizia di Stato",       "icona": "🚓", "descrizione": "Questura di Udine",                        "password": "" },
+    { "id": "carabinieri",    "nome": "Carabinieri",            "icona": "🚔", "descrizione": "Comando Provinciale di Udine",             "password": "" },
+    { "id": "gdf",            "nome": "Guardia di Finanza",     "icona": "🛡️", "descrizione": "Comando Provinciale",                      "password": "" },
+    { "id": "polizia-locale", "nome": "Polizia Locale",         "icona": "🚦", "descrizione": "Comando di Udine",                         "password": "" },
+    { "id": "118",            "nome": "118 Soccorso",           "icona": "🚑", "descrizione": "Emergenza sanitaria",                      "password": "" },
+    { "id": "vvf",            "nome": "Vigili del Fuoco",       "icona": "🚒", "descrizione": "Comando Provinciale",                      "password": "" },
+    { "id": "meccanici",      "nome": "Soccorso Stradale",      "icona": "🔧", "descrizione": "Meccanici e carro attrezzi",               "password": "" },
+    { "id": "staff",          "nome": "Staff",                  "icona": "⭐", "descrizione": "Solo staff del server",                    "password": "staff2026" }
+  ],
+
+  "reparti": [
+    { "nome": "Civile",             "icona": "👤", "colore": "#9ca3af" },
+    { "nome": "Polizia di Stato",   "icona": "🚓", "colore": "#38bdf8" },
+    { "nome": "Carabinieri",        "icona": "🚔", "colore": "#818cf8" },
+    { "nome": "Guardia di Finanza", "icona": "🛡️", "colore": "#eab308" },
+    { "nome": "Polizia Locale",     "icona": "🚦", "colore": "#2dd4bf" },
+    { "nome": "118 / Soccorso",     "icona": "🚑", "colore": "#fb923c" },
+    { "nome": "Vigili del Fuoco",   "icona": "🚒", "colore": "#ef4444" },
+    { "nome": "Meccanico / ACI",    "icona": "🔧", "colore": "#84cc16" },
+    { "nome": "Staff",              "icona": "⭐", "colore": "#f472b6" }
+  ]
+}

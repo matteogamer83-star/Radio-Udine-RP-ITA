@@ -1,0 +1,17 @@
+{
+  "name": "radio-udine-rp",
+  "version": "1.0.0",
+  "description": "Radio push-to-talk in stile walkie-talkie per la community Udine RP ITA",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
