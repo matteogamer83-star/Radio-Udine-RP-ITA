@@ -8,6 +8,7 @@ Una radio stile walkie-talkie (come Zello) per la community **Udine RP ITA**:
 - **Ruoli personalizzati** (Comandante, Vice, Staff…) con permessi decisi **solo dal Founder**
 - **Tasto PTT per Windows**: parli tenendo premuto un tasto **anche dentro al gioco**
 - **🚨 SOS**: sirena, schermata rossa e **una voce che legge la posizione**; arriva anche alla Centrale
+- **📡 Centrale operativa**: chi gestisce emergenze e notizie parla a **più radio insieme** (tutte o solo alcune), sente le loro risposte e manda **comunicati, allerte ed emergenze**
 - Canale **🔁 Prova audio (eco)**: parli e ti risenti subito, così controlli microfono e casse da solo
 - Cronologia con riascolto dei vocali, chat di testo, effetto radio, installabile come app sul telefono
 
@@ -21,8 +22,9 @@ Una radio stile walkie-talkie (come Zello) per la community **Udine RP ITA**:
 | Creare account, cambiare password, disattivare o eliminare utenti normali | ✅ | ✅ se ha «Gestire gli utenti» | ❌ |
 | Aggiungere o togliere canali, cambiare le password dei canali (anche Staff) | ✅ | ✅ se ha «Gestire i canali» | ❌ |
 | Entrare in tutti i canali senza password | ✅ | ✅ se ha «Accesso a tutti i canali» | ❌ |
+| 📡 Centrale: parlare a più canali, sentire le risposte, mandare comunicati | ✅ | ✅ se ha «Centrale operativa» | ❌ |
 | Creare ruoli e decidere i loro permessi | ✅ | ❌ | ❌ |
-| Dare un ruolo con permessi (cioè creare Staff) | ✅ | ❌ | ❌ |
+| Dare un ruolo con permessi (Staff, Operatore Centrale…) | ✅ | ❌ | ❌ |
 | Modificare lo Staff | ✅ | ❌ | ❌ |
 | Impostazioni del server e backup | ✅ | ❌ | ❌ |
 
@@ -78,8 +80,10 @@ Dal pannello puoi anche dare una nuova password 🔑, disattivare 🚫 (la perso
 - **Gestire gli utenti**: creare account, nuove password, disattivare ed eliminare (solo utenti normali)
 - **Gestire i canali**: aggiungere e togliere radio, cambiare password e accessi
 - **Accesso a tutti i canali**: entra ovunque senza password
+- **📡 Centrale operativa**: parla a più canali insieme, sente le risposte, manda comunicati (vedi sezione 7)
 
-Un ruolo con almeno un permesso conta come **Staff**: solo il Founder può assegnarlo e solo il Founder può modificare chi lo ha.
+Un ruolo con almeno un permesso lo può assegnare **solo il Founder**, e solo il Founder può modificare chi lo ha.
+C'è già pronto il ruolo **📡 Operatore Centrale** (solo il permesso Centrale): dallo a chi gestisce le emergenze.
 
 ## 6. Parlare anche dentro al gioco (Windows) 🎮
 
@@ -96,7 +100,31 @@ Il browser da solo sente i tasti solo quando la sua finestra è in primo piano. 
 Funziona come il push-to-talk di Discord. Se avvii il gioco "come amministratore", avvia anche il file del tasto come amministratore.
 Il file contiene il tuo codice personale: **non condividerlo**. Per cambiare tasto riaprilo e scrivi `C`.
 
-## 7. 🚨 SOS
+## 7. 📡 Centrale operativa: parlare a più radio insieme
+
+Per chi gestisce emergenze e notizie (il Founder ce l'ha già; agli altri dai il ruolo **📡 Operatore Centrale**, oppure spunta **Centrale operativa** in un ruolo tuo).
+Sopra al pulsante per parlare compare la barra **📡 CENTRALE**:
+
+1. Accendi **Più canali**
+2. Tocca i canali a cui vuoi parlare (diventano azzurri), oppure **Tutti**. Con **Tutti** sono compresi anche i canali che crei dopo; un canale nuovo compare comunque subito nella barra
+3. **Tieni premuto e parla**: ti sentono in diretta tutti i canali scelti + quello in cui sei. Il pulsante dice *"PARLA A 4 CANALI"*
+4. **Senti le risposte**: quando qualcuno risponde nel suo canale (es. Polizia) lo senti anche tu. Sul display vedi da quale canale arriva. Il tasto 👂 / 🔇 accende o spegne l'ascolto
+5. **Priorità**: se in un canale scelto qualcuno sta parlando, la Centrale lo interrompe e prende la linea; mentre parla la Centrale nessuno può interromperla
+6. Anche i **messaggi scritti** vanno a tutti i canali scelti
+
+**📢 Comunicato**: scegli il tipo, scrivi cosa succede, il luogo (facoltativo) e a quali canali (alcuni o tutti):
+
+| Tipo | Cosa succede a chi lo riceve |
+|---|---|
+| 📢 Notizia | avviso sonoro, finestra azzurra, una voce legge il messaggio |
+| ⚠️ Allerta | finestra arancione, suono di allarme, la voce lo legge due volte |
+| 🚨 Emergenza | schermata rossa e **sirena** (anche con l'audio su muto), la voce legge messaggio e luogo |
+
+Chi lo riceve preme **Ricevuto**: tu lo vedi subito e in cronologia resta l'elenco di chi ha risposto.
+
+> La Centrale lavora sui canali che il suo ruolo può vedere (anche quelli con password). Per raggiungere anche i canali riservati a certi ruoli, dai alla Centrale anche **Accesso a tutti i canali**.
+
+## 8. 🚨 SOS
 
 Premi **🚨 SOS**, scrivi dove sei (es. *Piazza Libertà, vicino alla stazione*) e invia. Chi è nel tuo canale e nella **Centrale Operativa**:
 
@@ -105,19 +133,19 @@ Premi **🚨 SOS**, scrivi dove sei (es. *Piazza Libertà, vicino alla stazione*
 - sente **una voce che legge la posizione** due volte
 - può premere **✅ Ricevuto, intervengo**: tu vedi e senti chi sta arrivando
 
-## 8. Usare la radio sul PC del server (senza Render)
+## 9. Usare la radio sul PC del server (senza Render)
 
 Doppio clic su **`avvia.bat`**: si apre la radio su `http://localhost:3000`. Alla prima accensione il **codice di installazione** è scritto nella finestra nera.
 I dati sono salvati nella cartella `data` (non cancellarla). Per far entrare amici da fuori usa `condividi-online.bat` (vedi sotto) o Render.
 
 **Link veloce dal tuo PC (gratis):** una volta sola scrivi in PowerShell `winget install --id Cloudflare.cloudflared`; poi, con la radio accesa, doppio clic su **`condividi-online.bat`** e manda il link `https://….trycloudflare.com` che compare. Cambia ogni volta che lo riapri.
 
-## 9. Installarla come app sul telefono
+## 10. Installarla come app sul telefono
 
 - **Android (Chrome)**: ⚙️ Impostazioni → **📲 Installa**, oppure menu **⋮** → *Installa app*
 - **iPhone (Safari)**: tasto **Condividi** → **Aggiungi alla schermata Home**
 
-## 10. Problemi comuni
+## 11. Problemi comuni
 
 - **"Parlo ma non sento niente"**: è normale, **chi parla non sente sé stesso**; gli altri ti sentono in diretta. Per provarti da solo entra in **🔁 Prova audio (eco)**: parli, rilasci e ti risenti.
   Mentre parli il display ti dice quante persone ti stanno ascoltando.
@@ -125,5 +153,6 @@ I dati sono salvati nella cartella `data` (non cancellarla). Per far entrare ami
 - **Il pulsante dice "SOLO ASCOLTO"**: toccalo e segui le istruzioni (permesso del microfono o link non `https://`).
 - **Il tasto PC non fa niente**: la radio nel browser deve essere aperta e con l'accesso fatto. In ⚙️ deve essere attivo *"Questo browser risponde al tasto PC"*. In alto deve comparire ⌨️.
 - **Render ci mette tanto ad aprirsi**: nel piano gratis dopo 15 minuti senza nessuno si "addormenta"; il primo accesso può richiedere circa un minuto.
+- **Non vedo la barra 📡 CENTRALE**: serve il permesso *Centrale operativa* (il Founder ce l'ha). Dopo un aggiornamento della radio ricarica la pagina (F5).
 - **Ho perso la password del Founder**: un altro con «Gestire gli utenti» non può cambiarla. Ripristina un backup oppure cancella i dati (Gist o cartella `data`) e rifai la prima accensione.
-- **Controllo automatico**: apri PowerShell in questa cartella e scrivi `npm test` (simula Founder, Staff e utenti e verifica 56 cose).
+- **Controllo automatico**: apri PowerShell in questa cartella e scrivi `npm test` (simula Founder, Staff, Centrale e utenti e verifica 80 cose).

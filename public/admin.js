@@ -286,7 +286,7 @@
     }
     for (const r of roles) {
       const p = r.permessi || {};
-      const extra = p.utenti || p.canali || p.tuttiCanali ? ' (staff)' : '';
+      const extra = p.utenti || p.canali || p.tuttiCanali || p.diramazione ? ' (con permessi)' : '';
       const o = el('option', null, `${r.icona} ${r.nome}${extra}`);
       o.value = r.id;
       sel.append(o);
@@ -318,7 +318,7 @@
       f.append(field('Password', pw, 'Comunicala all\'utente: potrà cambiarla dalle Impostazioni.'));
     }
     f.append(field('Nome RP', nome), field('Sigla / nominativo (facoltativo)', sigla));
-    f.append(field('Ruolo', ruolo, lockRole ? 'Non puoi cambiare il ruolo di questo account.' : perms().founder ? 'I ruoli "(staff)" danno permessi di gestione.' : 'Puoi assegnare solo ruoli senza permessi di Staff.'));
+    f.append(field('Ruolo', ruolo, lockRole ? 'Non puoi cambiare il ruolo di questo account.' : perms().founder ? 'I ruoli "(con permessi)" danno poteri speciali (gestione, Centrale…).' : 'Puoi assegnare solo ruoli senza permessi speciali.'));
     if (!ruolo.options.length) f.append(el('p', 'adm-warn', 'Non ci sono ruoli assegnabili: chiedi al Founder di crearne uno.'));
 
     modal.open({
@@ -528,14 +528,15 @@
     if (p.utenti) w.append(badge('👥 gestisce utenti', 'gold'));
     if (p.canali) w.append(badge('📻 gestisce canali', 'gold'));
     if (p.tuttiCanali) w.append(badge('🔓 tutti i canali', 'blue'));
-    if (!p.utenti && !p.canali && !p.tuttiCanali) w.append(badge('nessun permesso speciale'));
+    if (p.diramazione) w.append(badge('📡 Centrale: più canali e comunicati', 'blue'));
+    if (!p.utenti && !p.canali && !p.tuttiCanali && !p.diramazione) w.append(badge('nessun permesso speciale'));
     return w;
   }
 
   function renderRoles(root) {
     const bar = el('div', 'adm-bar');
     bar.append(
-      el('p', 'muted small grow', 'Solo tu, Founder, puoi creare ruoli (es. Comandante, Vice, Staff) e decidere cosa possono fare. I ruoli con permessi di gestione contano come Staff: solo tu puoi assegnarli.'),
+      el('p', 'muted small grow', 'Solo tu, Founder, puoi creare ruoli (es. Comandante, Vice, Staff, Operatore Centrale) e decidere cosa possono fare. I ruoli con permessi speciali li puoi assegnare solo tu.'),
       btn('➕ Nuovo ruolo', 'btn-primary', () => roleForm(null))
     );
     root.append(bar);
@@ -544,7 +545,7 @@
     const fr = el('div', 'adm-row fixed');
     const fmain = el('div', 'adm-main');
     fmain.append(el('b', null, '👑 Founder'), el('small', null, 'Tu. Può fare tutto. Non modificabile.'));
-    fmain.append(permBadges({ utenti: true, canali: true, tuttiCanali: true }));
+    fmain.append(permBadges({ utenti: true, canali: true, tuttiCanali: true, diramazione: true }));
     fr.append(el('span', 'big-ic', '👑'), fmain);
     list.append(fr);
 
@@ -576,12 +577,17 @@
     const pu = checkbox('👥 Gestire gli utenti', p.utenti, 'Creare account, dare nuove password, disattivare ed eliminare utenti (solo quelli senza permessi di Staff).');
     const pc = checkbox('📻 Gestire i canali', p.canali, 'Aggiungere e togliere radio, cambiare le password dei canali e chi può entrare.');
     const pt = checkbox('🔓 Accesso a tutti i canali', p.tuttiCanali, 'Vede ed entra in ogni canale, anche protetti, senza password.');
+    const pd = checkbox(
+      '📡 Centrale operativa',
+      p.diramazione,
+      'Per chi gestisce emergenze e notizie: parla a più canali insieme (con priorità su chi sta parlando), sente le loro risposte e manda comunicati / allerte / emergenze. Funziona su tutti i canali che il ruolo può vedere.'
+    );
 
     const f = el('div', 'form-grid');
     const icRow = el('div', 'stack');
     icRow.append(icona, iconPicker(icona, ROLE_ICONS));
     const permBox = el('div', 'stack');
-    permBox.append(pu, pc, pt);
+    permBox.append(pd, pu, pc, pt);
     f.append(field('Nome del ruolo', nome), field('Icona', icRow), field('Colore', colore), field('Permessi', permBox, 'Senza permessi = utente normale della radio.'));
 
     modal.open({
@@ -600,7 +606,7 @@
               nome: nome.value,
               icona: icona.value,
               colore: colore.value,
-              permessi: { utenti: pu.cb.checked, canali: pc.cb.checked, tuttiCanali: pt.cb.checked },
+              permessi: { utenti: pu.cb.checked, canali: pc.cb.checked, tuttiCanali: pt.cb.checked, diramazione: pd.cb.checked },
             });
             toast(isNew ? '✅ Ruolo creato' : '✅ Ruolo aggiornato');
             load();

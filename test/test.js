@@ -292,6 +292,109 @@ async function main() {
     send(L, { t: 'alert' });
     ok((await waitFor(L, 'error')).code === 'rate', 'anti-spam SOS attivo');
 
+    // ---------------------------------------------------- CENTRALE: più canali insieme, ascolto, comunicati
+    st = await req(F, 'state');
+    const OPC = roleBy('Operatore Centrale');
+    ok(OPC && OPC.permessi.diramazione && !OPC.permessi.utenti, 'esiste il ruolo "Operatore Centrale" con il permesso Centrale');
+    ok(/assegnare/.test(await reqFails(S, 'user_create', { username: 'furbo3', password: 'xxxxxx', nome: 'Furbo', ruolo: OPC.id })), 'solo il Founder può dare il permesso Centrale');
+    await req(F, 'user_create', { username: 'centrale1', password: 'centralepass', nome: 'Sara Gialli', sigla: 'Centrale 2', ruolo: OPC.id });
+    await req(F, 'user_create', { username: 'carlo', password: 'carlopass', nome: 'Carlo Viola', ruolo: CIV.id });
+    const D = await login('Centrale', 'centrale1', 'centralepass', { proto: 3 });
+    const C = await login('Carlo', 'carlo', 'carlopass');
+    all.push(D, C);
+    ok(D.welcome.perms.diramazione && !M.welcome.perms.diramazione, "l'operatore ha il permesso Centrale, gli utenti normali no");
+    await joinCh(D, 'centrale');
+    await joinCh(L, '118');
+    await joinCh(C, 'carabinieri');
+    for (const r of [M, L, G, P, C, D]) {
+      r.msgs = [];
+      r.bins = [];
+    }
+
+    // ascolto: la Centrale sente anche Polizia e 118 senza entrarci
+    send(L, { t: 'monitor', canali: ['polizia'] }); // utente normale: ignorato
+    send(D, { t: 'monitor', canali: ['polizia', '118'] });
+    await sleep(100);
+    send(P, { t: 'ptt_start' });
+    await waitFor(P, 'ptt_ok');
+    const dts = await waitFor(D, 'talk_start', (m) => m.user.nome === 'Paolo Blu');
+    ok(dts.via && dts.via.id === 'polizia', 'la Centrale sente in diretta chi parla in Polizia (senza entrare nel canale)');
+    const pAudio = tone(400, 500);
+    for (let i = 0; i < pAudio.length; i += 1280) P.ws.send(pAudio.subarray(i, i + 1280));
+    send(P, { t: 'ptt_stop' });
+    const dte = await waitFor(D, 'talk_end', (m) => m.user.nome === 'Paolo Blu');
+    const dPcm = Buffer.concat(D.bins.filter((b) => b.readUInt16LE(0) === dts.n).map((b) => b.subarray(2)));
+    ok(dPcm.equals(pAudio), 'la voce della Polizia arriva intatta alla Centrale');
+    ok((await fetch(`http://127.0.0.1:${PORT}/api/msg/polizia/${dte.msg.id}.wav?k=${D.welcome.key}`)).ok, 'la Centrale può riascoltare i vocali dei canali che ascolta');
+    ok(L.bins.length === 0 && (await noMsg(L, 'talk_start', 200)), 'un utente normale NON può ascoltare altri canali');
+
+    // parlare a più canali insieme
+    for (const r of [M, L, G, P, C]) {
+      r.msgs = [];
+      r.bins = [];
+    }
+    send(D, { t: 'ptt_start', diramazione: true, canali: ['polizia', '118'] });
+    const dok = await waitFor(D, 'ptt_ok');
+    ok(dok.canali === 3 && dok.ascoltatori === 3, `la Centrale parla a 3 canali insieme (${dok.ascoltatori} persone in ascolto)`);
+    const [tsP, tsL, tsG] = await Promise.all([waitFor(P, 'talk_start'), waitFor(L, 'talk_start'), waitFor(G, 'talk_start')]);
+    ok(tsP.prio && tsP.canali === 3 && tsL.prio && tsG.prio, 'Polizia, 118 e Centrale ricevono la diramazione');
+    const dAudio = tone(500, 700);
+    for (let i = 0; i < dAudio.length; i += 1280) D.ws.send(dAudio.subarray(i, i + 1280));
+    send(D, { t: 'ptt_stop' });
+    const [teP] = await Promise.all([
+      waitFor(P, 'talk_end', (m) => m.user.nome === 'Sara Gialli'),
+      waitFor(L, 'talk_end', (m) => m.user.nome === 'Sara Gialli'),
+    ]);
+    ok(Buffer.concat(P.bins).equals(dAudio) && Buffer.concat(L.bins).equals(dAudio), 'Polizia e 118 sentono la Centrale in diretta, audio intatto');
+    ok((await noMsg(C, 'talk_start', 200)) && C.bins.length === 0 && M.bins.length === 0, 'i canali non scelti (Carabinieri, Generale) non sentono niente');
+    const wavP = await fetch(`http://127.0.0.1:${PORT}/api/msg/polizia/${teP.msg.id}.wav?k=${P.welcome.key}`);
+    ok(teP.msg.canali === 3 && wavP.ok, 'il messaggio della Centrale resta nella cronologia di ogni canale');
+
+    // priorità: la Centrale interrompe chi sta parlando
+    send(M, { t: 'ptt_start' });
+    await waitFor(M, 'ptt_ok');
+    send(D, { t: 'ptt_start', diramazione: true, canali: ['generale'] });
+    const cut = await waitFor(M, 'ptt_cut');
+    ok(cut.by.nome === 'Sara Gialli' && (await waitFor(D, 'ptt_ok')).canali === 2, 'PRIORITÀ: la Centrale interrompe chi sta parlando e prende la linea');
+    send(M, { t: 'ptt_start' });
+    const busy = await waitFor(M, 'ptt_busy');
+    ok(busy.prio && busy.by.nome === 'Sara Gialli', 'mentre parla la Centrale nessuno può interromperla');
+    send(D, { t: 'ptt_stop' });
+    await waitFor(M, 'talk_end', (m) => m.user.nome === 'Sara Gialli');
+    P.msgs = [];
+    send(M, { t: 'ptt_start', diramazione: true, canali: ['polizia'] });
+    ok((await waitFor(M, 'ptt_ok')).canali === 1 && (await noMsg(P, 'talk_start', 300)), 'un utente normale NON può parlare su più canali');
+    send(M, { t: 'ptt_stop' });
+
+    // messaggi scritti e comunicati
+    send(D, { t: 'text', text: 'Tutte le unità: posto di blocco in via Roma', diramazione: true, canali: ['polizia', '118'] });
+    const [txP, txL] = await Promise.all([waitFor(P, 'text'), waitFor(L, 'text')]);
+    ok(txP.msg.testo === txL.msg.testo && txP.msg.canali === 3, 'la Centrale scrive a più canali insieme');
+    send(M, { t: 'annuncio', livello: 'info', text: 'ciao', canali: ['polizia'] });
+    ok((await waitFor(M, 'error')).code === 'perm', 'un utente normale NON può mandare comunicati');
+    G.msgs = [];
+    send(D, { t: 'annuncio', livello: 'emergenza', text: 'Rapina in corso alla banca', luogo: 'Piazza Libertà', canali: ['polizia', '118'] });
+    const [anP, anL, anD] = await Promise.all([waitFor(P, 'annuncio'), waitFor(L, 'annuncio'), waitFor(D, 'annuncio')]);
+    ok(anP.msg.livello === 'emergenza' && anP.msg.luogo === 'Piazza Libertà' && anL.msg.testo === 'Rapina in corso alla banca', 'COMUNICATO di emergenza con luogo arriva ai canali scelti');
+    ok(anD.mio && anD.persone === 2 && (await noMsg(G, 'annuncio', 300)) && (await noMsg(C, 'annuncio', 50)), 'chi lo manda sa a quante persone è arrivato; gli altri canali non lo ricevono');
+    send(P, { t: 'annuncio_ack', id: anP.msg.id });
+    ok((await waitFor(D, 'annuncio_ack')).by.nome === 'Paolo Blu', 'la Centrale vede chi ha risposto "Ricevuto"');
+
+    // i canali creati dopo compaiono subito e si possono usare
+    await req(F, 'channel_save', { nome: 'Rapina Banca', icona: '🏦' });
+    const rbs = await waitFor(D, 'session', (m) => m.channels.some((c) => c.nome === 'Rapina Banca'));
+    const rb = rbs.channels.find((c) => c.nome === 'Rapina Banca');
+    ok(!!rb, 'un canale appena creato compare subito alla Centrale');
+    await joinCh(C, rb.id);
+    send(D, { t: 'ptt_start', diramazione: true, canali: [rb.id, 'polizia'] });
+    await waitFor(D, 'ptt_ok');
+    ok((await waitFor(C, 'talk_start')).prio, 'la Centrale parla anche nel canale appena creato');
+    send(D, { t: 'ptt_stop' });
+    await sleep(1600); // anti-spam dei comunicati
+    send(D, { t: 'annuncio', livello: 'allerta', text: 'Allerta meteo: grandine in arrivo', tutti: true });
+    const anC = await waitFor(C, 'annuncio');
+    ok(anC.msg.tutti && anC.msg.livello === 'allerta' && !!(await waitFor(M, 'annuncio')), 'comunicato a TUTTI i canali: arriva ovunque, anche nel canale nuovo');
+
     // ---------------------------------------------------- canale eco (prova audio da soli)
     await joinCh(M, 'prova-audio');
     M.bins = [];
@@ -344,10 +447,27 @@ async function main() {
     const F2 = await login('Founder-dopo', 'boss', 'segreta1');
     all.push(F2);
     st = await req(F2, 'state');
-    ok(st.users.length === 6 && st.roles.some((r) => r.nome === 'Comandante') && !st.channels.some((c) => c.id === 'meccanici'), 'dopo il riavvio utenti, ruoli e canali sono ancora lì');
+    ok(st.users.length === 8 && st.roles.some((r) => r.nome === 'Comandante') && !st.channels.some((c) => c.id === 'meccanici'), 'dopo il riavvio utenti, ruoli e canali sono ancora lì');
     const M5 = await login('Mario-dopo', 'mario', 'scelta-da-me');
     all.push(M5);
     ok(M5.welcome.me.sigla === 'Volante 7', 'Mario entra con la password che si era scelto');
+
+    // ---------------------------------------------------- aggiornamento di dati vecchi (v2)
+    for (const c of all) c.ws.terminate();
+    await sleep(300);
+    await stopServer();
+    const old = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    old.version = 2;
+    old.roles = old.roles.filter((r) => r.nome !== 'Operatore Centrale');
+    for (const r of old.roles) delete r.permessi.diramazione;
+    old.users = old.users.filter((u) => u.username !== 'centrale1');
+    fs.writeFileSync(DATA_FILE, JSON.stringify(old));
+    await startServer();
+    const F3 = await login('Founder-v2', 'boss', 'segreta1');
+    all.push(F3);
+    st = await req(F3, 'state');
+    const upg = st.roles.find((r) => r.nome === 'Operatore Centrale');
+    ok(upg && upg.permessi.diramazione && F3.welcome.perms.diramazione, 'dati della versione precedente: compare il ruolo "Operatore Centrale" e il Founder ha il permesso');
 
     for (const c of all) c.ws.terminate();
     console.log(`\n🎉 Tutti i ${passed} controlli superati: la radio funziona!\n`);

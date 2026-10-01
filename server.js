@@ -8,6 +8,8 @@
  * - Audio in tempo reale via WebSocket (PCM 16 bit, 16 kHz, mono)
  * - Tasto PTT per Windows che funziona anche con il gioco in primo piano
  * - SOS con sirena e posizione, inoltrato anche ai canali "Centrale"
+ * - Centrale operativa: parla a più canali insieme (con priorità), ascolta le
+ *   risposte e manda comunicati / allerte / emergenze ai canali che sceglie
  */
 
 const http = require('http');
@@ -34,7 +36,9 @@ const MAX_SEND_BUFFER = 1024 * 1024;
 const HEARTBEAT_MS = 25000;
 const TOKEN_DAYS = 120;
 
-const NO_PERMS = { utenti: false, canali: false, tuttiCanali: false };
+const NO_PERMS = { utenti: false, canali: false, tuttiCanali: false, diramazione: false };
+const ALL_PERMS = { utenti: true, canali: true, tuttiCanali: true, diramazione: true };
+const LIVELLI = ['info', 'allerta', 'emergenza'];
 const FOUNDER_ROLE = { id: 'founder', nome: 'Founder', icona: '👑', colore: '#f2c230' };
 const ECO_ROLE = { id: 'eco', nome: 'Prova audio', icona: '🔁', colore: '#22d3ee' };
 const ECO_USER = { id: 0, uid: 'eco', nome: 'Eco · la tua voce', sigla: '', ruolo: 'eco' };
@@ -117,7 +121,8 @@ function seedData() {
     staff = { id: 'r' + rid(4), nome: 'Staff', icona: '⭐', colore: '#f472b6', permessi: {} };
     roles.push(staff);
   }
-  staff.permessi = { utenti: true, canali: true, tuttiCanali: true };
+  staff.permessi = { ...ALL_PERMS };
+  roles.push({ id: 'r' + rid(4), ...CENTRALE_ROLE, permessi: { ...NO_PERMS, diramazione: true } });
 
   const used = new Set();
   const channels = (config.canali || [{ nome: 'Generale' }]).map((c) => {
@@ -137,7 +142,7 @@ function seedData() {
   });
 
   return {
-    version: 2,
+    version: 3,
     secret: rid(32),
     settings: {
       nomeServer: clean(config.nomeServer, 40) || 'Udine RP ITA',
@@ -150,12 +155,19 @@ function seedData() {
   };
 }
 
+// ruolo pronto per chi gestisce emergenze e notizie (si può modificare o eliminare)
+const CENTRALE_ROLE = { nome: 'Operatore Centrale', icona: '📡', colore: '#38bdf8' };
+
 function migrate(d) {
-  d.version = 2;
+  const from = Number(d.version) || 1;
+  d.version = 3;
   if (!d.secret) d.secret = rid(32);
   d.settings = Object.assign({ nomeServer: 'Udine RP ITA', durataMassimaTrasmissione: 60, messaggiVocaliSalvati: 20 }, d.settings || {});
   d.roles = Array.isArray(d.roles) ? d.roles : [];
   for (const r of d.roles) r.permessi = Object.assign({}, NO_PERMS, r.permessi || {});
+  if (from < 3 && !d.roles.some((r) => r.permessi.diramazione)) {
+    d.roles.push({ id: 'r' + rid(4), ...CENTRALE_ROLE, permessi: { ...NO_PERMS, diramazione: true } });
+  }
   d.users = Array.isArray(d.users) ? d.users : [];
   for (const u of d.users) {
     if (u.tv == null) u.tv = 1;
@@ -178,14 +190,15 @@ const maxVoice = () => clamp(Number(settings().messaggiVocaliSalvati ?? 20), 0, 
 // ================================================================== ruoli e permessi
 
 function roleOf(user) {
-  if (user.founder) return { ...FOUNDER_ROLE, permessi: { utenti: true, canali: true, tuttiCanali: true } };
+  if (user.founder) return { ...FOUNDER_ROLE, permessi: { ...ALL_PERMS } };
   return db.roles.find((r) => r.id === user.ruolo) || { id: user.ruolo, nome: '—', icona: '👤', colore: '#9ca3af', permessi: { ...NO_PERMS } };
 }
 function permsOf(user) {
   const p = roleOf(user).permessi;
-  return { founder: !!user.founder, utenti: !!p.utenti, canali: !!p.canali, tuttiCanali: !!p.tuttiCanali };
+  return { founder: !!user.founder, utenti: !!p.utenti, canali: !!p.canali, tuttiCanali: !!p.tuttiCanali, diramazione: !!p.diramazione };
 }
-const isAdminRole = (r) => !!(r && r.permessi && (r.permessi.utenti || r.permessi.canali || r.permessi.tuttiCanali));
+/** Ruolo con almeno un permesso speciale: lo assegna e lo gestisce solo il Founder */
+const isAdminRole = (r) => !!(r && r.permessi && Object.keys(NO_PERMS).some((k) => r.permessi[k]));
 const hasAdmin = (user) => {
   const p = permsOf(user);
   return p.founder || p.utenti || p.canali;
@@ -194,6 +207,8 @@ function canSee(user, cfg) {
   const p = permsOf(user);
   return p.founder || p.tuttiCanali || cfg.ruoli.length === 0 || cfg.ruoli.includes(user.ruolo);
 }
+/** Canali in cui la Centrale può parlare e ascoltare (tutti quelli che vede, tranne l'eco) */
+const canTarget = (user, cfg) => !cfg.eco && canSee(user, cfg);
 function needsPassword(user, cfg) {
   const p = permsOf(user);
   return !!cfg.password && !p.founder && !p.tuttiCanali;
@@ -286,24 +301,26 @@ const vColor = (s) => (/^#[0-9a-f]{6}$/i.test(String(s || '')) ? String(s).toLow
 
 // ================================================================== canali a runtime
 
-const channels = new Map(); // id -> { cfg, clients, talker, current, voice, texts, ... }
+// id -> { cfg, clients, monitors (Centrale in ascolto da fuori), talk (trasmissione in corso), voice, texts }
+const channels = new Map();
 
 function syncChannels() {
   if (!db) return;
   const ids = new Set(db.channels.map((c) => c.id));
   for (const [id, ch] of channels) {
     if (ids.has(id)) continue;
+    if (ch.talk) endTalk(ch.talk, 'gone');
+    for (const c of ch.monitors) if (c.monitor) c.monitor.delete(id);
     for (const c of [...ch.clients]) {
       leaveChannel(c);
       send(c, { t: 'channel_gone', msg: `Il canale ${ch.cfg.nome} è stato eliminato.` });
     }
-    clearTimeout(ch.talkTimer);
     channels.delete(id);
   }
   const old = new Map(channels);
   channels.clear();
   for (const cfg of db.channels) {
-    const ch = old.get(cfg.id) || { id: cfg.id, clients: new Set(), talker: null, current: null, talkTimer: null, voice: [], voiceBytes: 0, texts: [] };
+    const ch = old.get(cfg.id) || { id: cfg.id, clients: new Set(), monitors: new Set(), talk: null, voice: [], voiceBytes: 0, texts: [] };
     ch.cfg = cfg;
     channels.set(cfg.id, ch);
   }
@@ -346,7 +363,7 @@ function channelInfo(user, ch) {
     descrizione: ch.cfg.descrizione,
     protetto: needsPassword(user, ch.cfg),
     utenti: ch.clients.size,
-    attivo: !!ch.talker,
+    attivo: !!ch.talk,
     sos: ch.cfg.riceveSos,
     eco: ch.cfg.eco,
   };
@@ -377,11 +394,13 @@ function sessionPayload(conn) {
     server: settings().nomeServer,
     maxTalk: maxTalkMs() / 1000,
     pcKeys: remotesOf(conn.user).length,
+    versione: VERSION,
   };
 }
 
 function kick(conn, msg) {
   leaveChannel(conn);
+  setMonitor(conn, []);
   send(conn, { t: 'kicked', msg });
   const user = conn.user;
   conn.user = null;
@@ -415,6 +434,7 @@ function refreshAll() {
       leaveChannel(c);
       send(c, { t: 'channel_gone', msg: 'Non hai più accesso a questo canale.' });
     }
+    if (c.monitor && c.monitor.size) setMonitor(c, [...c.monitor]); // permessi cambiati: ricontrolla l'ascolto
     send(c, { t: 'session', ...sessionPayload(c) });
   }
   for (const ch of channels.values()) broadcast(ch, { t: 'users', users: [...ch.clients].map(publicUser) });
@@ -432,65 +452,222 @@ function afterChange() {
   refreshAdmins();
 }
 
-// ================================================================== canali e trasmissione
+/// ================================================================== canali e trasmissione
+//
+// Una trasmissione ("talk") può andare su UN canale (normale) oppure su PIÙ canali insieme
+// (diramazione della Centrale, con priorità). La sentono:
+//   - chi è dentro ai suoi canali
+//   - chi ha il permesso Centrale e "ascolta" quei canali da fuori (monitor)
+// L'audio verso le radio aggiornate ha 2 byte davanti con il numero della trasmissione,
+// così la Centrale può sentire più canali che parlano nello stesso momento.
+
+const chMini = (ch) => ({ id: ch.id, nome: ch.cfg.nome, icona: ch.cfg.icona });
+let streamSeq = 0;
+const nextStream = () => (streamSeq = (streamSeq % 65535) + 1);
+
+function frame(n, data) {
+  const b = Buffer.allocUnsafe(data.length + 2);
+  b.writeUInt16LE(n, 0);
+  data.copy(b, 2);
+  return b;
+}
+
+/** Chi riceve qualcosa mandato a questi canali. Valore = canale da cui lo ascolta (null = è dentro) */
+function audienceOf(list) {
+  const out = new Map();
+  for (const ch of list) for (const c of ch.clients) out.set(c, null);
+  for (const ch of list) for (const c of ch.monitors) if (!out.has(c)) out.set(c, ch);
+  return out;
+}
+/** Persone diverse (non dispositivi) in un elenco di connessioni */
+function countPeople(list, exceptUid) {
+  const s = new Set();
+  for (const c of list) if (c.user && c.user.id !== exceptUid) s.add(c.user.id);
+  return s.size;
+}
+/** Canale in cui sei + (solo per la Centrale) i canali scelti */
+function pickTargets(conn, ch, msg) {
+  const list = [ch];
+  if (!msg.diramazione || ch.cfg.eco || !permsOf(conn.user).diramazione || !Array.isArray(msg.canali)) return list;
+  for (const id of msg.canali.slice(0, 100)) {
+    const c = channels.get(String(id));
+    if (c && !list.includes(c) && canTarget(conn.user, c.cfg)) list.push(c);
+  }
+  return list;
+}
+
+function talkStartMsg(talk, via) {
+  return {
+    t: 'talk_start',
+    user: talk.from,
+    id: talk.id,
+    n: talk.n,
+    via: via ? chMini(via) : null,
+    canali: talk.channels.length,
+    prio: talk.prio,
+    origine: chMini(talk.origin),
+  };
+}
 
 function leaveChannel(conn) {
   const ch = conn.channel && channels.get(conn.channel);
-  conn.channel = null;
   stopEcho(conn, true);
+  if (conn.talk) endTalk(conn.talk, 'left');
+  conn.channel = null;
   if (!ch) return;
-  if (ch.talker === conn) endTalk(ch, 'left');
   ch.clients.delete(conn);
   if (conn.user) broadcast(ch, { t: 'user_leave', user: publicUser(conn) });
   scheduleChannelsUpdate();
 }
 
-function endTalk(ch, reason) {
-  clearTimeout(ch.talkTimer);
-  ch.talkTimer = null;
-  const cur = ch.current;
-  const talker = ch.talker;
-  ch.talker = null;
-  ch.current = null;
-  if (!cur) return;
+function endTalk(talk, reason) {
+  if (talk.ended) return;
+  talk.ended = true;
+  clearTimeout(talk.timer);
+  for (const ch of talk.channels) if (ch.talk === talk) ch.talk = null;
+  if (talk.conn.talk === talk) talk.conn.talk = null;
 
-  const seconds = cur.bytes / 2 / SAMPLE_RATE;
+  const seconds = talk.bytes / 2 / SAMPLE_RATE;
   let meta = null;
   if (seconds >= MIN_VOICE_SECONDS) {
-    const pcm = cur.keep ? Buffer.concat(cur.chunks) : null;
-    if (ch.cfg.eco) {
-      if (pcm && talker && (reason === 'stop' || reason === 'timeout')) setTimeout(() => startEcho(talker, pcm, ch), 350);
+    const pcm = talk.keep ? Buffer.concat(talk.chunks) : null;
+    if (talk.origin.cfg.eco) {
+      if (pcm && (reason === 'stop' || reason === 'timeout')) setTimeout(() => startEcho(talk.conn, pcm, talk.origin), 350);
     } else {
-      meta = { tipo: 'voce', id: cur.id, from: cur.from, ts: cur.ts, durata: Math.round(seconds * 10) / 10 };
+      meta = { tipo: 'voce', id: talk.id, from: talk.from, ts: talk.ts, durata: Math.round(seconds * 10) / 10 };
+      if (talk.channels.length > 1) meta.canali = talk.channels.length;
+      if (talk.prio) meta.prio = true;
       if (pcm && maxVoice() > 0) {
-        ch.voice.push({ meta, pcm });
-        ch.voiceBytes += pcm.length;
-        while (ch.voice.length > maxVoice() || ch.voiceBytes > MAX_HISTORY_BYTES) {
-          const old = ch.voice.shift();
-          ch.voiceBytes -= old.pcm.length;
+        for (const ch of talk.channels) {
+          ch.voice.push({ meta, pcm });
+          ch.voiceBytes += pcm.length;
+          while (ch.voice.length > maxVoice() || ch.voiceBytes > MAX_HISTORY_BYTES) {
+            const old = ch.voice.shift();
+            ch.voiceBytes -= old.pcm.length;
+          }
         }
       }
-      log(`#${ch.id}  ${cur.from.nome} ha parlato ${meta.durata}s`);
+      const where = talk.channels.length > 1 ? `#${talk.origin.id} + ${talk.channels.length - 1} canali (Centrale)` : `#${talk.origin.id}`;
+      log(`${where}  ${talk.from.nome} ha parlato ${meta.durata}s${reason === 'cut' ? ' (interrotto dalla Centrale)' : ''}`);
     }
   }
-  broadcast(ch, { t: 'talk_end', user: cur.from, id: cur.id, msg: meta, reason });
-  if (talker && talker.user) notifyRemote(talker.user, { state: 'idle' });
+  const aud = audienceOf(talk.channels);
+  if (reason === 'left') aud.delete(talk.conn);
+  else aud.set(talk.conn, null); // chi parlava vede il suo vocale in cronologia
+  for (const [c, via] of aud) {
+    send(c, { t: 'talk_end', user: talk.from, id: talk.id, n: talk.n, msg: meta, reason, via: via ? chMini(via) : null });
+  }
+  if (talk.conn.user) notifyRemote(talk.conn.user, { state: 'idle' });
   scheduleChannelsUpdate();
+}
+
+/** La Centrale prende la linea: chi stava parlando viene interrotto */
+function cutTalk(talk, by) {
+  send(talk.conn, { t: 'ptt_cut', by: publicUser(by) });
+  endTalk(talk, 'cut');
+}
+
+function startTalk(conn, msg) {
+  const user = conn.user;
+  const ch = conn.channel && channels.get(conn.channel);
+  if (!ch) return;
+  if (conn.talk) {
+    const t = conn.talk;
+    return send(conn, { t: 'ptt_ok', maxTalk: maxTalkMs() / 1000, canali: t.channels.length, prio: t.prio, saltati: [] });
+  }
+  stopEcho(conn);
+  const prio = !!msg.diramazione && !ch.cfg.eco && permsOf(user).diramazione;
+  const wanted = pickTargets(conn, ch, msg);
+
+  const own = ch.talk;
+  if (own && (!prio || own.prio)) {
+    notifyRemote(user, { state: 'busy', da: own.from.nome });
+    return send(conn, { t: 'ptt_busy', by: own.from, prio: own.prio });
+  }
+  const list = [];
+  const saltati = [];
+  for (const c of wanted) {
+    if (c.talk && c.talk.prio) {
+      saltati.push(c.cfg.nome); // un'altra Centrale sta già parlando lì
+      continue;
+    }
+    if (c.talk) cutTalk(c.talk, conn);
+    list.push(c);
+  }
+
+  const talk = {
+    id: rid(),
+    n: nextStream(),
+    conn,
+    from: publicUser(conn),
+    ts: Date.now(),
+    chunks: [],
+    bytes: 0,
+    keep: ch.cfg.eco || maxVoice() > 0,
+    channels: list,
+    origin: ch,
+    prio,
+    timer: null,
+    ended: false,
+  };
+  for (const c of list) {
+    c.talk = talk;
+    for (const x of c.clients) if (x !== conn) stopEcho(x);
+  }
+  conn.talk = talk;
+  talk.timer = setTimeout(() => {
+    if (conn.talk !== talk) return;
+    send(conn, { t: 'ptt_timeout' });
+    endTalk(talk, 'timeout');
+  }, maxTalkMs());
+
+  const aud = audienceOf(list);
+  aud.delete(conn);
+  const ascoltatori = countPeople(aud.keys(), user.id);
+  send(conn, { t: 'ptt_ok', maxTalk: maxTalkMs() / 1000, canali: list.length, ascoltatori, saltati, prio });
+  for (const [c, via] of aud) send(c, talkStartMsg(talk, via));
+  notifyRemote(user, { state: 'on', canale: list.length > 1 ? `${list.length} canali (Centrale)` : ch.cfg.nome, ascoltatori });
+  if (list.length > 1) log(`📡 ${displayName(user)} parla su ${list.length} canali: ${list.map((c) => c.cfg.nome).join(', ')}`);
+  scheduleChannelsUpdate();
+}
+
+/** La Centrale ascolta anche questi canali (oltre a quello in cui si trova) */
+function setMonitor(conn, ids) {
+  const want = new Set();
+  if (conn.kind === 'web' && conn.user && permsOf(conn.user).diramazione && Array.isArray(ids)) {
+    for (const id of ids.slice(0, 100)) {
+      const ch = channels.get(String(id));
+      if (ch && canTarget(conn.user, ch.cfg)) want.add(ch.id);
+    }
+  }
+  const old = conn.monitor || new Set();
+  for (const id of old) {
+    const ch = channels.get(id);
+    if (ch && !want.has(id)) ch.monitors.delete(conn);
+  }
+  conn.monitor = want;
+  for (const id of want) {
+    if (old.has(id)) continue;
+    const ch = channels.get(id);
+    ch.monitors.add(conn);
+    const talk = ch.talk; // sta già parlando qualcuno: fallo sapere subito
+    if (talk && talk.conn !== conn && !talk.channels.some((x) => x.id === conn.channel)) send(conn, talkStartMsg(talk, ch));
+  }
 }
 
 // Canale "eco": dopo che hai parlato il server ti rimanda la tua voce, come in diretta
 function startEcho(conn, pcm, ch) {
-  if (conn.channel !== ch.id || ch.talker || conn.ws.readyState !== WebSocket.OPEN) return;
+  if (conn.channel !== ch.id || ch.talk || conn.ws.readyState !== WebSocket.OPEN) return;
   stopEcho(conn, true);
-  const echo = { id: rid(), pos: 0, timer: null };
+  const echo = { id: rid(), n: nextStream(), pos: 0, timer: null };
   conn.echo = echo;
-  send(conn, { t: 'talk_start', user: ECO_USER, id: echo.id, eco: true });
+  send(conn, { t: 'talk_start', user: ECO_USER, id: echo.id, n: echo.n, eco: true });
   echo.timer = setInterval(() => {
     if (conn.echo !== echo) return;
     if (conn.ws.readyState !== WebSocket.OPEN || conn.channel !== ch.id) return stopEcho(conn, true);
     const slice = pcm.subarray(echo.pos, echo.pos + 1280);
     if (!slice.length) return stopEcho(conn);
-    conn.ws.send(slice, { binary: true });
+    conn.ws.send(conn.hdr ? frame(echo.n, slice) : slice, { binary: true });
     echo.pos += 1280;
   }, 40);
 }
@@ -499,19 +676,20 @@ function stopEcho(conn, silent) {
   if (!e) return;
   clearInterval(e.timer);
   conn.echo = null;
-  if (!silent) send(conn, { t: 'talk_end', user: ECO_USER, id: e.id, msg: null, reason: 'eco' });
+  if (!silent) send(conn, { t: 'talk_end', user: ECO_USER, id: e.id, n: e.n, msg: null, reason: 'eco' });
 }
 
 function onAudio(conn, data) {
-  const ch = conn.channel && channels.get(conn.channel);
-  if (!ch || ch.talker !== conn || !ch.current) return;
+  const talk = conn.talk;
+  if (!talk) return;
   if (data.length === 0 || data.length > MAX_AUDIO_FRAME || data.length % 2 !== 0) return;
-  if (ch.current.keep) ch.current.chunks.push(data);
-  ch.current.bytes += data.length;
-  for (const c of ch.clients) {
+  if (talk.keep) talk.chunks.push(data);
+  talk.bytes += data.length;
+  const framed = frame(talk.n, data);
+  for (const c of audienceOf(talk.channels).keys()) {
     if (c === conn || c.ws.readyState !== WebSocket.OPEN) continue;
     if (c.ws.bufferedAmount > MAX_SEND_BUFFER) continue; // rete lenta: salta il pacchetto
-    c.ws.send(data, { binary: true });
+    c.ws.send(c.hdr ? framed : data, { binary: true }); // le radio non aggiornate ricevono l'audio senza numero
   }
 }
 
@@ -526,6 +704,13 @@ function pushText(ch, m) {
   ch.texts.push(m);
   if (ch.texts.length > MAX_TEXT_HISTORY) ch.texts.shift();
 }
+function findText(tipo, id) {
+  for (const c of channels.values()) {
+    const m = c.texts.find((x) => x.tipo === tipo && x.id === id);
+    if (m) return m;
+  }
+  return null;
+}
 
 // ================================================================== accesso
 
@@ -535,6 +720,7 @@ function authOk(conn, user, msg, extra) {
   conn.tv = user.tv;
   conn.key = rid(16);
   conn.remoteOk = !!(msg && msg.tastoPc);
+  conn.hdr = Number(msg && msg.proto) >= 3; // radio aggiornata: audio con il numero della trasmissione
   byKey.set(conn.key, conn);
   user.ultimoAccesso = Date.now();
   persist.schedule(30000);
@@ -792,7 +978,7 @@ async function request(conn, msg) {
         nome: vText(msg.nome, 30, 'Nome del ruolo', true),
         icona: vIcon(msg.icona, '👤'),
         colore: vColor(msg.colore),
-        permessi: { utenti: !!pm.utenti, canali: !!pm.canali, tuttiCanali: !!pm.tuttiCanali },
+        permessi: { utenti: !!pm.utenti, canali: !!pm.canali, tuttiCanali: !!pm.tuttiCanali, diramazione: !!pm.diramazione },
       };
       need(!/^founder$/i.test(data.nome), 'Il nome "Founder" è riservato.');
       if (msg.id) {
@@ -879,7 +1065,7 @@ function handleWeb(conn, msg) {
         t: 'joined',
         channel: channelInfo(user, target),
         users: [...target.clients].map(publicUser),
-        talker: target.talker ? publicUser(target.talker) : null,
+        talker: target.talk ? talkStartMsg(target.talk, null) : null,
         feed: channelFeed(target),
       });
       break;
@@ -889,31 +1075,16 @@ function handleWeb(conn, msg) {
       leaveChannel(conn);
       break;
 
-    case 'ptt_start': {
-      if (!ch) return;
-      stopEcho(conn, true);
-      if (ch.talker && ch.talker !== conn) {
-        notifyRemote(user, { state: 'busy', da: displayName(ch.talker.user) });
-        return send(conn, { t: 'ptt_busy', by: publicUser(ch.talker) });
-      }
-      if (ch.talker === conn) return send(conn, { t: 'ptt_ok', maxTalk: maxTalkMs() / 1000 });
-      for (const c of ch.clients) stopEcho(c);
-      ch.talker = conn;
-      ch.current = { id: rid(), from: publicUser(conn), ts: Date.now(), chunks: [], bytes: 0, keep: ch.cfg.eco || maxVoice() > 0 };
-      ch.talkTimer = setTimeout(() => {
-        if (ch.talker !== conn) return;
-        send(conn, { t: 'ptt_timeout' });
-        endTalk(ch, 'timeout');
-      }, maxTalkMs());
-      send(conn, { t: 'ptt_ok', maxTalk: maxTalkMs() / 1000 });
-      broadcast(ch, { t: 'talk_start', user: publicUser(conn), id: ch.current.id }, conn);
-      notifyRemote(user, { state: 'on', canale: ch.cfg.nome, ascoltatori: ch.clients.size - 1 });
-      scheduleChannelsUpdate();
+    case 'ptt_start':
+      startTalk(conn, msg);
       break;
-    }
 
     case 'ptt_stop':
-      if (ch && ch.talker === conn) endTalk(ch, 'stop');
+      if (conn.talk) endTalk(conn.talk, 'stop');
+      break;
+
+    case 'monitor':
+      setMonitor(conn, msg.canali);
       break;
 
     case 'text': {
@@ -923,9 +1094,70 @@ function handleWeb(conn, msg) {
       const testo = clean(msg.text, 300);
       if (!testo) return;
       conn.lastText = now;
+      const list = pickTargets(conn, ch, msg); // la Centrale può scrivere a più canali insieme
       const m = { tipo: 'testo', id: rid(), from: publicUser(conn), ts: now, testo };
-      pushText(ch, m);
-      broadcast(ch, { t: 'text', msg: m });
+      if (list.length > 1) m.canali = list.length;
+      for (const c of list) pushText(c, m);
+      const aud = audienceOf(list);
+      aud.set(conn, null);
+      for (const [c, via] of aud) send(c, { t: 'text', msg: m, via: via ? chMini(via) : null });
+      break;
+    }
+
+    // Comunicato della Centrale: notizia, allerta o emergenza ai canali scelti
+    case 'annuncio': {
+      if (!permsOf(user).diramazione) return send(conn, { t: 'error', code: 'perm', msg: 'Non hai il permesso di mandare comunicati.' });
+      const now = Date.now();
+      if (now - (conn.lastNews || 0) < 1500) return send(conn, { t: 'error', code: 'rate', msg: 'Aspetta qualche secondo prima di mandare un altro comunicato.' });
+      const testo = clean(msg.text, 300);
+      if (!testo) return send(conn, { t: 'error', code: 'dati', msg: 'Scrivi il testo del comunicato.' });
+      let list;
+      if (msg.tutti) list = [...channels.values()].filter((c) => canTarget(user, c.cfg));
+      else {
+        list = [];
+        for (const id of (Array.isArray(msg.canali) ? msg.canali : []).slice(0, 100)) {
+          const c = channels.get(String(id));
+          if (c && !list.includes(c) && canTarget(user, c.cfg)) list.push(c);
+        }
+      }
+      if (!list.length) return send(conn, { t: 'error', code: 'dati', msg: 'Scegli almeno un canale a cui mandare il comunicato.' });
+      conn.lastNews = now;
+      const m = {
+        tipo: 'annuncio',
+        id: rid(),
+        from: publicUser(conn),
+        ts: now,
+        livello: LIVELLI.includes(msg.livello) ? msg.livello : 'info',
+        testo,
+        luogo: clean(msg.luogo, 80),
+        tutti: !!msg.tutti,
+        canali: list.map(chMini),
+        presoDa: [],
+      };
+      for (const c of list) pushText(c, m);
+      const aud = new Set();
+      for (const c of list) for (const x of c.clients) if (x.user && x.user.id !== user.id) aud.add(x);
+      const data = JSON.stringify({ t: 'annuncio', msg: m });
+      for (const c of aud) if (c.ws.readyState === WebSocket.OPEN) c.ws.send(data);
+      for (const w of webOf(user)) send(w, { t: 'annuncio', msg: m, mio: true, persone: countPeople(aud) });
+      log(`📢 Comunicato (${m.livello}) di ${displayName(user)} a ${list.length} canali: ${testo}${m.luogo ? ' — ' + m.luogo : ''}`);
+      break;
+    }
+
+    case 'annuncio_ack': {
+      const m = findText('annuncio', msg.id);
+      if (!m || m.from.uid === user.id || !m.canali.some((c) => c.id === conn.channel)) return;
+      if (m.presoDa.some((x) => x.uid === user.id) || m.presoDa.length >= 200) return;
+      const by = publicUser(conn);
+      m.presoDa.push({ uid: user.id, nome: displayName(user) });
+      const aud = new Set();
+      for (const x of m.canali) {
+        const c = channels.get(x.id);
+        if (c) for (const y of c.clients) aud.add(y);
+      }
+      for (const c of conns) if (c.kind === 'web' && c.user && c.user.id === m.from.uid) aud.add(c);
+      const data = JSON.stringify({ t: 'annuncio_ack', id: m.id, by, annuncio: { from: m.from, livello: m.livello, testo: m.testo } });
+      for (const c of aud) if (c.ws.readyState === WebSocket.OPEN) c.ws.send(data);
       break;
     }
 
@@ -944,7 +1176,7 @@ function handleWeb(conn, msg) {
         testo: clean(msg.text, 120),
         canale: { id: ch.id, nome: ch.cfg.nome, icona: ch.cfg.icona },
       };
-      const targets = new Set(ch.clients);
+      const targets = new Set([...ch.clients, ...ch.monitors]);
       pushText(ch, m);
       for (const other of channels.values()) {
         if (other === ch || !other.cfg.riceveSos) continue;
@@ -958,11 +1190,7 @@ function handleWeb(conn, msg) {
     }
 
     case 'sos_ack': {
-      let m = null;
-      for (const c of channels.values()) {
-        m = c.texts.find((x) => x.tipo === 'allerta' && x.id === msg.id);
-        if (m) break;
-      }
+      const m = findText('allerta', msg.id);
       if (!m) return;
       m.presoDa = m.presoDa || [];
       if (m.presoDa.some((x) => x.uid === user.id)) return;
@@ -971,6 +1199,7 @@ function handleWeb(conn, msg) {
       const targets = new Set();
       for (const c of channels.values()) {
         if (c.id === m.canale.id || c.cfg.riceveSos) for (const x of c.clients) targets.add(x);
+        if (c.id === m.canale.id) for (const x of c.monitors) targets.add(x);
       }
       const data = JSON.stringify({ t: 'sos_ack', id: m.id, by, alert: { from: m.from, testo: m.testo } });
       for (const c of targets) if (c.ws.readyState === WebSocket.OPEN) c.ws.send(data);
@@ -1130,7 +1359,8 @@ const server = http.createServer((req, res) => {
   if (m) {
     const conn = byKey.get(url.searchParams.get('k') || '');
     const ch = channels.get(decodeURIComponent(m[1]));
-    if (!conn || !ch || conn.channel !== ch.id) return sendJson(res, 403, { errore: 'Non autorizzato' });
+    const ascolta = conn && ch && (conn.channel === ch.id || (conn.monitor && conn.monitor.has(ch.id)));
+    if (!ascolta) return sendJson(res, 403, { errore: 'Non autorizzato' });
     const item = ch.voice.find((v) => v.meta.id === m[2]);
     if (!item) return sendJson(res, 404, { errore: 'Messaggio non più disponibile' });
     const wav = wavFromPcm(item.pcm);
@@ -1178,6 +1408,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     conns.delete(conn);
     leaveChannel(conn);
+    setMonitor(conn, []);
     if (conn.key) byKey.delete(conn.key);
     const user = conn.user;
     if (!user) return;
@@ -1231,7 +1462,9 @@ async function init() {
       const data = await store.load();
       dbError = '';
       if (data) {
+        const before = data.version;
         db = migrate(data);
+        if (before !== db.version) persist.schedule(); // dati aggiornati (es. nuovo ruolo Centrale): salvali subito
         syncChannels();
         log(`Dati caricati: ${db.users.length} utenti, ${db.roles.length} ruoli, ${db.channels.length} canali — archivio: ${store.descrizione()}`);
       } else {

@@ -6,6 +6,8 @@
 (function () {
   const SR = 16000; // frequenza dell'audio trasmesso
   const APP_NAME = 'Radio Udine RP';
+  const APP_VERSION = '2.1.0'; // uguale a package.json: se il server è più nuovo la pagina si ricarica da sola
+  const PROTO = 3; // audio con il numero della trasmissione (per sentire più canali insieme)
 
   // ================================================================ utilità
   const $ = (s) => document.querySelector(s);
@@ -72,10 +74,8 @@
     chPwd: store.get('chpwd', {}),
     pendingJoin: null,
     pcKeys: 0,
-    talker: null,
-    talkStart: 0,
-    rxEndTimer: null,
     tx: 'idle', // idle | pending | on | stopping
+    txInfo: {}, // risposta del server: canali, ascoltatori, saltati
     pttHeld: false,
     pttSource: null,
     preBuffer: [],
@@ -87,6 +87,7 @@
     pingTimer: null,
     busyUntil: 0,
     busyBy: null,
+    busyPrio: false,
   };
 
   function roleInfo(id) {
@@ -95,10 +96,6 @@
   function displayName(u) {
     if (!u) return '';
     return u.sigla ? `${u.sigla} · ${u.nome}` : u.nome;
-  }
-  function me() {
-    const m = state.me || {};
-    return { id: state.myId, uid: m.uid, nome: m.nome, sigla: m.sigla, ruolo: m.ruolo };
   }
   const isMine = (u) => !!u && !!state.me && u.uid === state.me.uid;
   function fmtTime(ts) {
@@ -251,7 +248,7 @@
 
   const audio = {
     ctx: null,
-    playTime: 0,
+    streams: new Map(), // numero trasmissione -> fine dell'audio già in coda (ogni voce ha la sua)
     sources: new Set(),
     stream: null,
     micOk: false,
@@ -440,11 +437,11 @@
       if (d.final) this.handlers.final();
     },
 
-    // Riproduce un pacchetto audio ricevuto in diretta (PCM 16 bit, 16 kHz)
-    playPcm(ab) {
+    // Riproduce un pacchetto audio ricevuto in diretta (PCM 16 bit, 16 kHz).
+    // "stream" = numero della trasmissione: voci diverse (es. Centrale che ascolta più canali) si sovrappongono
+    playPcm(i16, stream) {
       const c = this.ctx;
       if (!c) return;
-      const i16 = new Int16Array(ab);
       const n = i16.length;
       if (!n) return;
       const rate = c.sampleRate;
@@ -461,13 +458,14 @@
         out[j] = a + (b - a) * f;
       }
       const now = c.currentTime;
-      if (this.playTime < now + 0.02) this.playTime = now + 0.15; // piccolo buffer anti-scatti
-      else if (this.playTime > now + 3) return; // troppo ritardo accumulato: scarta
+      let at = this.streams.get(stream) || 0;
+      if (at < now + 0.02) at = now + 0.15; // piccolo buffer anti-scatti
+      else if (at > now + 3) return; // troppo ritardo accumulato: scarta
       const s = c.createBufferSource();
       s.buffer = buf;
       s.connect(this.input);
-      s.start(this.playTime);
-      this.playTime += outLen / rate;
+      s.start(at);
+      this.streams.set(stream, at + outLen / rate);
       this.sources.add(s);
       s.onended = () => this.sources.delete(s);
       if (c.state !== 'running') this.resume().then(() => ui.audioBanner());
@@ -480,7 +478,11 @@
         } catch (e) {}
       }
       this.sources.clear();
-      this.playTime = 0;
+      this.streams.clear();
+    },
+    /** Quando finisce l'audio già in coda di una trasmissione (in secondi del contesto audio) */
+    endOf(stream) {
+      return this.streams.get(stream) || 0;
     },
 
     tone(freq, start, dur, opts) {
@@ -553,7 +555,33 @@
         case 'error':
           this.tone(300, t, 0.2, { type: 'square', vol: 0.07 });
           break;
+        case 'prio': // parla la Centrale: tre note in salita
+          this.tone(988, t, 0.07, { vol: 0.12 });
+          this.tone(1319, t + 0.08, 0.07, { vol: 0.12 });
+          this.tone(1760, t + 0.16, 0.1, { vol: 0.12 });
+          break;
       }
+    },
+
+    // Avvisi dei comunicati (suonano anche con l'audio su "muto"). Ritornano la durata in secondi.
+    alertTone() {
+      const c = this.ctx;
+      if (!c) return 0;
+      this.stopSiren();
+      const t = c.currentTime + 0.05;
+      for (let i = 0; i < 4; i++) {
+        this.sirenNodes.push(this.tone(1047, t + i * 0.5, 0.18, { type: 'square', vol: 0.09, out: this.alarmOut }));
+        this.sirenNodes.push(this.tone(1397, t + i * 0.5 + 0.2, 0.18, { type: 'square', vol: 0.09, out: this.alarmOut }));
+      }
+      return 2.1;
+    },
+    chime() {
+      const c = this.ctx;
+      if (!c) return 0;
+      this.stopSiren();
+      const t = c.currentTime + 0.05;
+      [523, 659, 784, 1047].forEach((f, i) => this.sirenNodes.push(this.tone(f, t + i * 0.13, 0.22, { vol: 0.13, out: this.alarmOut })));
+      return 0.75;
     },
 
     // Sirena bitonale dell'SOS (suona anche con l'audio su muto). Ritorna la durata in secondi.
@@ -642,11 +670,16 @@
       ui.status('connecting');
       ws.onopen = () => {
         const msg = state.pendingAuth || { t: 'auth', token: state.token };
-        ws.send(JSON.stringify(Object.assign({}, msg, { tastoPc: !!settings.tastoPc })));
+        ws.send(JSON.stringify(Object.assign({}, msg, { tastoPc: !!settings.tastoPc, proto: PROTO })));
       };
       ws.onmessage = (e) => {
         if (typeof e.data !== 'string') {
-          audio.playPcm(e.data);
+          // 2 byte con il numero della trasmissione + audio PCM 16 bit
+          const ab = e.data;
+          if (ab.byteLength < 4 || ab.byteLength % 2) return;
+          const n = new DataView(ab).getUint16(0, true);
+          audio.playPcm(new Int16Array(ab, 2), n);
+          rx.touch(n);
           return;
         }
         let m;
@@ -730,6 +763,7 @@
   };
 
   function applySession(m) {
+    if (!state.me || !m.me || state.me.uid !== m.me.uid) disp.load(m.me && m.me.uid);
     state.me = m.me;
     state.perms = m.perms || {};
     state.roles = new Map((m.roles || []).map((r) => [r.id, r]));
@@ -744,13 +778,31 @@
     ui.header();
     ui.users();
     ui.adminButtons();
+    disp.render();
+    disp.syncMonitor();
     ui.ptt();
+    ui.lcd();
     if (RadioApp.onSession) RadioApp.onSession();
+  }
+
+  // Il server è stato aggiornato: ricarica la pagina (una volta sola) per avere la radio nuova
+  function checkVersion(v) {
+    if (!v || v === APP_VERSION) return false;
+    let done = '';
+    try {
+      done = sessionStorage.getItem('radio-urp:reload') || '';
+      sessionStorage.setItem('radio-urp:reload', v);
+    } catch (e) {}
+    if (done === v) return false;
+    toast('🔄 Radio aggiornata, ricarico…');
+    setTimeout(() => location.reload(), 600);
+    return true;
   }
 
   function onMessage(m) {
     switch (m.t) {
       case 'welcome': {
+        if (checkVersion(m.versione)) return;
         state.myId = m.id;
         state.key = m.key;
         if (m.token) {
@@ -762,6 +814,8 @@
         store.set('lastName', displayName(m.me));
         state.online = true;
         state.reconnectDelay = 1000;
+        disp.lastMon = ''; // connessione nuova: il server non sa ancora cosa ascoltiamo
+        disp.syncMonitor();
         clearInterval(state.pingTimer);
         state.pingTimer = setInterval(() => net.send({ t: 'ping' }), 20000);
         if (!state.loggedIn) {
@@ -795,6 +849,9 @@
         }
         ui.channels();
         ui.header();
+        disp.render();
+        disp.syncMonitor();
+        ui.ptt();
         break;
       case 'channel_gone':
         toast(m.msg || 'Il canale non è più disponibile');
@@ -821,6 +878,9 @@
         ui.channels();
         ui.users();
         ui.feedReset(m.feed || []);
+        disp.render();
+        disp.syncMonitor();
+        ui.ptt();
         if (m.talker) rx.start(m.talker, true);
         else ui.lcd();
         break;
@@ -841,13 +901,13 @@
         }
         break;
       case 'talk_start':
-        rx.start(m.user);
+        rx.start(m);
         break;
       case 'talk_end':
         rx.end(m);
         break;
       case 'text':
-        ui.feedAdd(m.msg);
+        ui.feedAdd(Object.assign({}, m.msg, { via: m.via || null }));
         if (!isMine(m.msg.from)) {
           audio.sfx('text');
           vibrate(20);
@@ -859,14 +919,23 @@
       case 'sos_ack':
         onSosAck(m);
         break;
+      case 'annuncio':
+        onAnnuncio(m);
+        break;
+      case 'annuncio_ack':
+        onAnnuncioAck(m);
+        break;
       case 'ptt_ok':
-        ptt.onOk();
+        ptt.onOk(m);
         break;
       case 'ptt_busy':
-        ptt.onBusy(m.by);
+        ptt.onBusy(m.by, m.prio);
         break;
       case 'ptt_timeout':
         ptt.onTimeout();
+        break;
+      case 'ptt_cut':
+        ptt.onCut(m.by);
         break;
       case 'remote_ptt':
         onRemotePtt(!!m.down);
@@ -990,42 +1059,90 @@
   }
 
   // ================================================================ ricezione (in diretta)
+  // Ogni trasmissione ha un numero (n). Di solito ce n'è una sola, ma la Centrale che ascolta
+  // più canali può sentirne diverse nello stesso momento.
   const rx = {
-    start(user, silent) {
-      clearTimeout(state.rxEndTimer);
-      audio.stopReplay();
-      state.talker = user;
-      state.talkStart = Date.now();
+    talks: new Map(), // n -> { user, id, n, via, canali, prio, eco, origine, start, last }
+    timers: new Map(),
+    watchTimer: 0,
+
+    start(t, silent) {
+      if (!t || !t.user || t.n == null) return;
+      const old = this.talks.get(t.n);
+      clearTimeout(this.timers.get(t.n));
+      this.timers.delete(t.n);
+      this.talks.set(t.n, Object.assign({}, t, { start: old ? old.start : Date.now(), last: Date.now() }));
+      this.watch();
+      if (old) return ui.lcd();
+      if (!t.via) audio.stopReplay();
       audio.resume();
-      if (!silent) audio.sfx('rxStart');
-      vibrate(25);
+      if (!silent) audio.sfx(t.prio ? 'prio' : 'rxStart');
+      vibrate(t.prio ? [50, 40, 50] : 25);
       ui.lcd();
       ui.users();
       ui.title();
       ui.audioBanner();
     },
+
+    touch(n) {
+      const t = this.talks.get(n);
+      if (t) t.last = Date.now();
+    },
+
     end(m) {
-      if (m.msg) ui.feedAdd(m.msg);
-      const u = m.user;
-      if (u.id === state.myId) return;
-      if (!state.talker || state.talker.id !== u.id) return;
+      if (m.msg) ui.feedAdd(Object.assign({}, m.msg, { via: m.via || null }));
+      const t = this.talks.get(m.n);
+      if (!t || this.timers.has(m.n)) return;
       const c = audio.ctx;
-      const endAt = c ? Math.max(audio.playTime, c.currentTime) : 0;
+      const endAt = c ? Math.max(audio.endOf(m.n), c.currentTime) : 0;
       audio.sfx('roger', endAt);
       const delay = c ? Math.max(0, (endAt - c.currentTime) * 1000) + 300 : 0;
-      clearTimeout(state.rxEndTimer);
-      state.rxEndTimer = setTimeout(() => {
-        if (state.talker && state.talker.id === u.id) {
-          state.talker = null;
-          ui.lcd();
-          ui.users();
-          ui.title();
-        }
-      }, delay);
+      this.timers.set(m.n, setTimeout(() => this.remove(m.n), delay));
     },
+
+    remove(n) {
+      clearTimeout(this.timers.get(n));
+      this.timers.delete(n);
+      if (!this.talks.delete(n)) return;
+      audio.streams.delete(n);
+      ui.lcd();
+      ui.users();
+      ui.title();
+    },
+
+    // rete persa a metà: se una voce non manda più audio da 4 secondi la tolgo dal display
+    watch() {
+      if (this.watchTimer) return;
+      this.watchTimer = setInterval(() => {
+        const now = Date.now();
+        for (const t of [...this.talks.values()]) if (now - t.last > 4000 && !this.timers.has(t.n)) this.remove(t.n);
+        if (!this.talks.size) {
+          clearInterval(this.watchTimer);
+          this.watchTimer = 0;
+        }
+      }, 1000);
+    },
+
+    latest() {
+      let best = null;
+      for (const t of this.talks.values()) if (!best || t.start >= best.start) best = t;
+      return best;
+    },
+    /** Qualcuno sta parlando nel MIO canale */
+    busyHere() {
+      for (const t of this.talks.values()) if (!t.via) return true;
+      return false;
+    },
+    talkingIds() {
+      const s = new Set();
+      for (const t of this.talks.values()) s.add(t.user.id);
+      return s;
+    },
+
     reset() {
-      clearTimeout(state.rxEndTimer);
-      if (state.talker && state.talker.id !== state.myId) state.talker = null;
+      for (const t of this.timers.values()) clearTimeout(t);
+      this.timers.clear();
+      this.talks.clear();
       audio.stopAll();
       ui.title();
     },
@@ -1051,9 +1168,11 @@
       state.tx = 'pending';
       state.pttHeld = true;
       state.preBuffer = [];
+      state.txInfo = {};
       const sid = ++this.sid;
       audio.startCapture(sid, { pcm: (b) => this.onPcm(b, sid), final: () => this.onFinal(sid) });
-      net.send({ t: 'ptt_start' });
+      // Centrale con "più canali" attivo: parla anche ai canali collegati, con priorità
+      net.send(disp.active() ? { t: 'ptt_start', diramazione: true, canali: disp.targetIds() } : { t: 'ptt_start' });
       clearTimeout(state.pendingTimer);
       state.pendingTimer = setTimeout(() => {
         if (state.tx === 'pending') {
@@ -1086,16 +1205,17 @@
       }
     },
 
-    onOk() {
+    onOk(m) {
       if (state.tx !== 'pending') return;
       clearTimeout(state.pendingTimer);
       state.tx = 'on';
       state.txStart = Date.now();
+      state.txInfo = m || {};
       for (const b of state.preBuffer) net.sendBinary(b);
       state.preBuffer = [];
       audio.sfx('permit');
       vibrate(40);
-      state.talker = me();
+      if (m && m.saltati && m.saltati.length) toast(`⚠️ Non ti sentono in: ${m.saltati.join(', ')} (lì sta già parlando un'altra Centrale)`, 6000);
       ui.lcd();
       ui.users();
       ui.ptt();
@@ -1120,14 +1240,25 @@
       audio.sfx('end');
     },
 
-    onBusy(by) {
+    onBusy(by, prio) {
       if (state.tx !== 'pending') return;
       audio.stopCapture(this.sid);
       this.sid++;
       this.reset();
       audio.sfx('busy');
       vibrate([60, 60, 60]);
-      ui.busy(by);
+      ui.busy(by, prio);
+    },
+
+    // la Centrale ha preso la linea mentre parlavi
+    onCut(by) {
+      if (state.tx !== 'on' && state.tx !== 'stopping') return;
+      audio.stopCapture(this.sid);
+      this.sid++;
+      this.reset();
+      audio.sfx('busy');
+      vibrate([80, 60, 80]);
+      toast(`📡 ${displayName(by)} (Centrale) ha preso la linea: la tua trasmissione è stata interrotta`, 6000);
     },
 
     onTimeout() {
@@ -1152,7 +1283,6 @@
       clearTimeout(state.stopTimer);
       state.tx = 'idle';
       state.preBuffer = [];
-      if (state.talker && state.talker.id === state.myId) state.talker = null;
       ui.lcd();
       ui.users();
       ui.ptt();
@@ -1201,10 +1331,11 @@
       await sleep(250);
       ui.meter(0);
       btn.textContent = '🔊 Riascolto…';
-      audio.playTime = 0;
-      for (const b of chunks) audio.playPcm(b);
-      const wait = audio.ctx ? Math.max(0, audio.playTime - audio.ctx.currentTime) : 0;
+      audio.streams.delete(0);
+      for (const b of chunks) audio.playPcm(new Int16Array(b), 0);
+      const wait = audio.ctx ? Math.max(0, audio.endOf(0) - audio.ctx.currentTime) : 0;
       await sleep(wait * 1000 + 250);
+      audio.streams.delete(0);
       btn.textContent = '🎙️ Prova microfono';
       btn.disabled = false;
       this.running = false;
@@ -1212,52 +1343,98 @@
     },
   };
 
-  // ================================================================ SOS
-  const sos = {
+  // ================================================================ allarmi: SOS e comunicati della Centrale
+  const KINDS = {
+    sos: { title: '🚨 SOS 🚨', ack: '✅ Ricevuto, intervengo', done: "✅ Hai risposto all'SOS", sev: 3, where: '📍 POSIZIONE' },
+    emergenza: { title: '🚨 EMERGENZA 🚨', ack: '✅ Ricevuto, intervengo', done: '✅ Hai risposto: stai intervenendo', sev: 3, where: '📍 LUOGO' },
+    allerta: { title: '⚠️ ALLERTA', ack: '✅ Ricevuto', done: '✅ Hai confermato', sev: 2, where: '📍 LUOGO' },
+    info: { title: '📢 COMUNICATO', ack: '👍 Ricevuto', done: '👍 Hai confermato', sev: 1, where: '📍 LUOGO' },
+  };
+  const LIVELLI = [
+    ['info', '📢 Notizia', 'Notizia: suona un avviso e una voce legge il messaggio. Per aggiornamenti e informazioni.'],
+    ['allerta', '⚠️ Allerta', 'Allerta: schermata arancione, suono di allarme e una voce che legge il messaggio due volte.'],
+    ['emergenza', '🚨 Emergenza', "Emergenza: schermata rossa e SIRENA (anche con l'audio su muto), poi una voce legge messaggio e luogo."],
+  ];
+
+  function canaliText(m) {
+    if (m.tutti) return '📡 A tutti i canali';
+    const list = m.canali || [];
+    const names = list
+      .slice(0, 4)
+      .map((c) => `${c.icona} ${c.nome}`)
+      .join(', ');
+    return `📡 A: ${names}${list.length > 4 ? ` e altri ${list.length - 4}` : ''}`;
+  }
+
+  const alarm = {
     current: null,
+    kind: null,
     timer: 0,
-    show(m) {
+    show(kind, m) {
+      const K = KINDS[kind];
+      if (this.current && this.current.id !== m.id && KINDS[this.kind].sev > K.sev) {
+        toast(`${K.title}: ${m.testo}`, 6000); // è già aperto un allarme più grave: questo resta in cronologia
+        return;
+      }
       this.current = m;
+      this.kind = kind;
       const r = roleInfo(m.from.ruolo);
+      const isSos = kind === 'sos';
+      const where = isSos ? m.testo : m.luogo;
+      $('#sosOverlay').dataset.kind = kind;
+      $('#sosTitle').textContent = K.title;
       $('#sosWho').textContent = displayName(m.from);
       $('#sosRole').textContent = `${r.icona} ${r.nome}`;
-      $('#sosWhere').textContent = m.testo || 'Posizione non indicata';
-      $('#sosWhere').classList.toggle('missing', !m.testo);
-      $('#sosChan').textContent = `Canale: ${m.canale.icona} ${m.canale.nome}`;
+      $('#sosText').hidden = isSos;
+      $('#sosText').textContent = isSos ? '' : m.testo;
+      $('#sosWhereBox').hidden = !isSos && !where;
+      $('#sosWhereLbl').textContent = K.where;
+      $('#sosWhere').textContent = where || 'Posizione non indicata';
+      $('#sosWhere').classList.toggle('missing', !where);
+      $('#sosChan').textContent = isSos ? `Canale: ${m.canale.icona} ${m.canale.nome}` : canaliText(m);
       $('#sosAcks').textContent = '';
       const b = $('#sosAck');
       b.disabled = false;
-      b.textContent = '✅ Ricevuto, intervengo';
+      b.textContent = K.ack;
       $('#sosOverlay').hidden = false;
       audio.resume();
-      const dur = audio.siren(4);
-      clearTimeout(this.timer);
-      this.timer = setTimeout(() => this.speak(), dur * 1000 + 300);
-      vibrate([400, 150, 400, 150, 800]);
-      notifySos(m);
+      this.stopSound();
+      const quiet = kind === 'info' && settings.muted; // le notizie rispettano il "muto", gli allarmi no
+      if (!quiet) {
+        const dur = isSos || kind === 'emergenza' ? audio.siren(4) : kind === 'allerta' ? audio.alertTone() : audio.chime();
+        this.timer = setTimeout(() => this.speak(), dur * 1000 + 300);
+      }
+      vibrate(kind === 'info' ? [120, 80, 120] : [400, 150, 400, 150, 800]);
+      notifyAlarm(kind, m);
     },
     speak() {
       const m = this.current;
       if (!m) return;
       const r = roleInfo(m.from.ruolo);
       const chi = (m.from.sigla ? m.from.sigla + ', ' : '') + m.from.nome;
-      const dove = m.testo ? `Posizione: ${m.testo}. Ripeto: ${m.testo}.` : 'Posizione non indicata.';
-      speak(`Attenzione! S O S da ${chi}, ${r.nome}. ${dove} Canale ${m.canale.nome}.`);
+      if (this.kind === 'sos') {
+        const dove = m.testo ? `Posizione: ${m.testo}. Ripeto: ${m.testo}.` : 'Posizione non indicata.';
+        speak(`Attenzione! S O S da ${chi}, ${r.nome}. ${dove} Canale ${m.canale.nome}.`);
+      } else if (this.kind === 'emergenza') {
+        speak(`Emergenza! ${chi} comunica: ${m.testo}.` + (m.luogo ? ` Luogo: ${m.luogo}. Ripeto: ${m.luogo}.` : ` Ripeto: ${m.testo}.`));
+      } else if (this.kind === 'allerta') {
+        speak(`Attenzione, allerta da ${chi}: ${m.testo}.` + (m.luogo ? ` Luogo: ${m.luogo}.` : '') + ` Ripeto: ${m.testo}.`);
+      } else {
+        speak(`Comunicato da ${chi}: ${m.testo}.` + (m.luogo ? ` Luogo: ${m.luogo}.` : ''));
+      }
     },
     ack() {
       if (!this.current) return;
-      net.send({ t: 'sos_ack', id: this.current.id });
+      net.send(this.kind === 'sos' ? { t: 'sos_ack', id: this.current.id } : { t: 'annuncio_ack', id: this.current.id });
       const b = $('#sosAck');
       b.disabled = true;
-      b.textContent = '✅ Hai risposto all\'SOS';
+      b.textContent = KINDS[this.kind].done;
     },
     addAck(text) {
       $('#sosAcks').append(el('div', null, '✅ ' + text));
     },
-    close() {
+    stopSound() {
       clearTimeout(this.timer);
-      $('#sosOverlay').hidden = true;
-      this.current = null;
       audio.stopSiren();
       if ('speechSynthesis' in window) {
         try {
@@ -1265,12 +1442,20 @@
         } catch (e) {}
       }
     },
+    close() {
+      this.stopSound();
+      $('#sosOverlay').hidden = true;
+      this.current = null;
+      this.kind = null;
+    },
   };
 
-  function notifySos(m) {
+  function notifyAlarm(kind, m) {
     if (!settings.notifiche || !('Notification' in window) || Notification.permission !== 'granted' || !document.hidden) return;
-    const title = `🚨 SOS — ${displayName(m.from)}`;
-    const opts = { body: `📍 ${m.testo || 'Posizione non indicata'} · ${m.canale.nome}`, tag: m.id, requireInteraction: true, icon: 'icons/icon-192.png' };
+    const isSos = kind === 'sos';
+    const title = `${isSos ? '🚨 SOS' : KINDS[kind].title} — ${displayName(m.from)}`;
+    const body = isSos ? `📍 ${m.testo || 'Posizione non indicata'} · ${m.canale.nome}` : m.testo + (m.luogo ? ` · 📍 ${m.luogo}` : '');
+    const opts = { body, tag: m.id, requireInteraction: kind !== 'info', icon: 'icons/icon-192.png' };
     const fallback = () => {
       try {
         new Notification(title, opts);
@@ -1297,17 +1482,45 @@
       toast('🚨 SOS inviato: sirena e posizione arrivano a tutto il canale e alla Centrale', 5000);
       return;
     }
-    sos.show(m);
+    alarm.show('sos', m);
   }
 
   function onSosAck(m) {
     const mineAck = isMine(m.by);
-    ui.system(`✅ ${displayName(m.by)} ha risposto all'SOS di ${displayName(m.alert.from)}`);
-    if (sos.current && sos.current.id === m.id) sos.addAck(displayName(m.by) + (mineAck ? ' (tu)' : ''));
+    const name = displayName(m.by);
+    ui.addAck(m.id, name);
+    ui.system(`✅ ${name} ha risposto all'SOS di ${displayName(m.alert.from)}`);
+    if (alarm.current && alarm.current.id === m.id) alarm.addAck(name + (mineAck ? ' (tu)' : ''));
     if (isMine(m.alert.from) && !mineAck) {
-      toast(`✅ ${displayName(m.by)} ha ricevuto il tuo SOS e sta intervenendo`, 7000);
+      toast(`✅ ${name} ha ricevuto il tuo SOS e sta intervenendo`, 7000);
       audio.sfx('permit');
       speak(`${m.by.nome} ha ricevuto il tuo S O S.`);
+    }
+  }
+
+  function onAnnuncio(m) {
+    const a = m.msg;
+    ui.feedAdd(a);
+    if (m.mio || isMine(a.from)) {
+      if (m.mio) {
+        audio.sfx('permit');
+        const dove = a.tutti ? 'tutti i canali' : a.canali.length === 1 ? '1 canale' : `${a.canali.length} canali`;
+        toast(`📢 Comunicato inviato a ${dove}: lo ricevono ${m.persone} ${m.persone === 1 ? 'persona collegata' : 'persone collegate'}`, 6000);
+      }
+      return;
+    }
+    if (a.livello !== 'info') flashApp();
+    alarm.show(KINDS[a.livello] ? a.livello : 'info', a);
+  }
+
+  function onAnnuncioAck(m) {
+    const name = displayName(m.by);
+    ui.addAck(m.id, name);
+    if (alarm.current && alarm.current.id === m.id) alarm.addAck(name + (isMine(m.by) ? ' (tu)' : ''));
+    if (isMine(m.annuncio.from) && !isMine(m.by)) {
+      toast(`✅ ${name} ha ricevuto il comunicato`, 5000);
+      audio.sfx('permit');
+      if (m.annuncio.livello === 'emergenza') speak(`${m.by.nome} interviene.`);
     }
   }
 
@@ -1331,6 +1544,247 @@
       ],
     });
     setTimeout(() => input.focus(), 60);
+  }
+
+  // ================================================================ Centrale operativa
+  // Chi ha il permesso "Centrale" collega più canali: parla a tutti insieme (con priorità),
+  // sente le loro risposte e manda comunicati (notizia, allerta, emergenza).
+  const DISP_DEFAULT = { on: false, tutti: false, canali: [], ascolta: true };
+  const disp = {
+    cfg: Object.assign({}, DISP_DEFAULT),
+    uid: null,
+    lastMon: '',
+    scroll: 0,
+
+    load(uid) {
+      this.uid = uid || null;
+      this.cfg = Object.assign({}, DISP_DEFAULT, (uid && store.get('disp:' + uid, null)) || {});
+      if (!Array.isArray(this.cfg.canali)) this.cfg.canali = [];
+    },
+    save() {
+      if (this.uid) store.set('disp:' + this.uid, this.cfg);
+    },
+    allowed() {
+      return !!(state.perms && state.perms.diramazione);
+    },
+    /** Tutti i canali che posso collegare: quelli che vedo, tranne l'eco. I canali nuovi compaiono da soli */
+    eligible() {
+      return state.channels.filter((c) => !c.eco);
+    },
+    linked(id) {
+      return this.cfg.tutti || this.cfg.canali.includes(id);
+    },
+    /** "Più canali" acceso adesso (nel canale eco no) */
+    active() {
+      return this.allowed() && this.cfg.on && !!state.channel && !state.channel.eco;
+    },
+    /** Canali collegati oltre a quello in cui sei */
+    targets() {
+      if (!this.active()) return [];
+      const cur = state.channel.id;
+      return this.eligible().filter((c) => c.id !== cur && this.linked(c.id));
+    },
+    targetIds() {
+      return this.targets().map((c) => c.id);
+    },
+    /** Dice al server quali canali ascoltare oltre al mio */
+    syncMonitor() {
+      if (!state.online) return;
+      const cur = state.channel && state.channel.id;
+      const ids =
+        this.allowed() && this.cfg.on && this.cfg.ascolta ? this.eligible().filter((c) => c.id !== cur && this.linked(c.id)).map((c) => c.id) : [];
+      const key = ids.join(',');
+      if (key === this.lastMon) return;
+      this.lastMon = key;
+      net.send({ t: 'monitor', canali: ids });
+    },
+    changed() {
+      this.save();
+      this.render();
+      this.syncMonitor();
+      ui.channels();
+      ui.ptt();
+      ui.lcd();
+    },
+    toggle() {
+      this.cfg.on = !this.cfg.on;
+      this.changed();
+      if (!this.cfg.on) return toast('📡 Più canali SPENTO: parli solo nel tuo canale');
+      const n = this.targets().length;
+      toast(n ? `📡 Più canali ACCESO: parli a ${n + 1} canali insieme` : '📡 Più canali ACCESO: tocca i canali qui sotto (o «Tutti») per collegarli', 4500);
+    },
+    toggleAll() {
+      this.cfg.tutti = !this.cfg.tutti;
+      if (!this.cfg.tutti) this.cfg.canali = [];
+      this.changed();
+    },
+    toggleCh(id) {
+      if (this.cfg.tutti) {
+        this.cfg.tutti = false;
+        this.cfg.canali = this.eligible()
+          .map((c) => c.id)
+          .filter((x) => x !== id);
+      } else if (this.cfg.canali.includes(id)) this.cfg.canali = this.cfg.canali.filter((x) => x !== id);
+      else this.cfg.canali.push(id);
+      this.changed();
+    },
+    toggleListen() {
+      this.cfg.ascolta = !this.cfg.ascolta;
+      this.changed();
+      toast(this.cfg.ascolta ? '👂 Senti anche le risposte dei canali collegati' : '🔇 Non senti più i canali collegati (solo il tuo)');
+    },
+
+    render() {
+      const bar = $('#dispBar');
+      const show = this.allowed() && state.loggedIn;
+      bar.hidden = !show;
+      ui.composer();
+      if (!show) return;
+      bar.textContent = '';
+      bar.classList.toggle('on', this.cfg.on);
+
+      const head = el('div', 'disp-head');
+      const sw = el('button', 'disp-sw' + (this.cfg.on ? ' on' : ''));
+      sw.type = 'button';
+      sw.title = 'Parla e ascolta su più canali insieme';
+      sw.setAttribute('aria-pressed', String(this.cfg.on));
+      sw.append(el('i'), el('span', null, 'Più canali'));
+      sw.onclick = () => this.toggle();
+      head.append(el('b', 'disp-title', '📡 CENTRALE'), sw);
+      if (this.cfg.on) {
+        const eco = state.channel && state.channel.eco;
+        const n = this.targets().length + 1;
+        head.append(el('span', 'disp-count', eco ? 'spento nel canale eco' : `${n} ${n === 1 ? 'canale' : 'canali'}`));
+        const lis = el('button', 'disp-btn' + (this.cfg.ascolta ? ' on' : ''), this.cfg.ascolta ? '👂' : '🔇');
+        lis.type = 'button';
+        lis.title = this.cfg.ascolta ? 'Senti le risposte dei canali collegati (tocca per spegnere)' : 'NON senti i canali collegati (tocca per accendere)';
+        lis.onclick = () => this.toggleListen();
+        head.append(lis);
+      }
+      const news = el('button', 'disp-btn news', '📢 Comunicato');
+      news.type = 'button';
+      news.title = 'Manda una notizia, un\'allerta o un\'emergenza ai canali che scegli';
+      news.onclick = () => openNews();
+      head.append(news);
+      bar.append(head);
+      if (!this.cfg.on) return;
+
+      const row = el('div', 'disp-chips');
+      const all = el('button', 'dchip all' + (this.cfg.tutti ? ' on' : ''));
+      all.type = 'button';
+      all.title = 'Tutti i canali, anche quelli che verranno creati dopo';
+      all.append(el('span', null, this.cfg.tutti ? '✅' : '📡'), el('span', 'dchip-name', 'Tutti'));
+      all.onclick = () => this.toggleAll();
+      row.append(all);
+      for (const c of this.eligible()) {
+        const here = !!state.channel && c.id === state.channel.id;
+        const b = el('button', 'dchip' + (here || this.linked(c.id) ? ' on' : '') + (here ? ' here' : '') + (c.attivo ? ' live' : ''));
+        b.type = 'button';
+        b.append(el('span', null, c.icona), el('span', 'dchip-name', c.nome), el('small', null, here ? 'sei qui' : String(c.utenti)));
+        b.title = here
+          ? 'Il canale in cui sei: è sempre incluso'
+          : `${c.nome}: ${c.utenti} ${c.utenti === 1 ? 'persona' : 'persone'}${c.attivo ? ' · qualcuno sta parlando' : ''}`;
+        if (here) b.disabled = true;
+        else b.onclick = () => this.toggleCh(c.id);
+        row.append(b);
+      }
+      bar.append(row);
+      row.scrollLeft = this.scroll; // i numeri si aggiornano spesso: non perdere lo scorrimento
+      row.onscroll = () => (this.scroll = row.scrollLeft);
+    },
+  };
+
+  function formCheck(label, checked, hint) {
+    const w = el('label', 'chk');
+    const cb = el('input');
+    cb.type = 'checkbox';
+    cb.checked = !!checked;
+    const t = el('span');
+    t.append(el('b', null, label));
+    if (hint) t.append(el('small', null, hint));
+    w.append(cb, t);
+    w.cb = cb;
+    return w;
+  }
+  function formField(label, control, hint) {
+    const f = el('div', 'fld');
+    f.append(el('span', 'fld-label', label), control);
+    if (hint) f.append(hint instanceof Node ? hint : el('small', 'fld-hint', hint));
+    return f;
+  }
+
+  // Comunicato della Centrale: notizia / allerta / emergenza a uno, alcuni o tutti i canali
+  function openNews() {
+    if (!state.online || !disp.allowed()) return toast('Non sei collegato');
+    let livello = 'info';
+    const hint = el('small', 'fld-hint', LIVELLI[0][2]);
+    const seg = el('div', 'seg seg-lv');
+    for (const [v, label, h] of LIVELLI) {
+      const b = el('button', 'lv-' + v + (v === livello ? ' on' : ''), label);
+      b.type = 'button';
+      b.onclick = () => {
+        livello = v;
+        seg.querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+        hint.textContent = h;
+      };
+      seg.append(b);
+    }
+    const testo = el('textarea', 'input');
+    testo.rows = 3;
+    testo.maxLength = 300;
+    testo.placeholder = 'Cosa sta succedendo? es. Rapina in corso alla banca, servono pattuglie';
+    const luogo = el('input', 'input');
+    luogo.maxLength = 80;
+    luogo.placeholder = 'es. Piazza Libertà (facoltativo)';
+
+    const allCk = formCheck('📡 TUTTI i canali', disp.cfg.on && disp.cfg.tutti, 'Anche quelli creati dopo');
+    const list = el('div', 'role-checks compact');
+    const pre = new Set([state.channel && state.channel.id, ...disp.targetIds()]);
+    for (const c of disp.eligible()) {
+      const k = formCheck(`${c.icona} ${c.nome}`, pre.has(c.id), `${c.utenti} ${c.utenti === 1 ? 'persona collegata' : 'persone collegate'}`);
+      k.dataset.id = c.id;
+      list.append(k);
+    }
+    const syncAll = () => {
+      list.classList.toggle('dim', allCk.cb.checked);
+      list.querySelectorAll('input').forEach((i) => (i.disabled = allCk.cb.checked));
+    };
+    allCk.cb.onchange = syncAll;
+    syncAll();
+    const who = el('div', 'stack');
+    who.append(allCk, list);
+
+    const body = el('div', 'form-grid');
+    body.append(formField('Tipo', seg, hint), formField('Messaggio', testo), formField('📍 Luogo', luogo), formField('A chi lo mandi', who));
+    modal.open({
+      title: '📢 Comunicato della Centrale',
+      body,
+      wide: true,
+      actions: [
+        { label: 'Annulla' },
+        {
+          label: '📢 Invia',
+          cls: 'btn-primary',
+          primary: true,
+          onClick: () => {
+            const text = testo.value.trim();
+            if (!text) {
+              toast('Scrivi il messaggio del comunicato');
+              testo.focus();
+              return false;
+            }
+            const tutti = allCk.cb.checked;
+            const canali = [...list.querySelectorAll('.chk')].filter((x) => x.cb.checked).map((x) => x.dataset.id);
+            if (!tutti && !canali.length) {
+              toast('Scegli almeno un canale');
+              return false;
+            }
+            net.send({ t: 'annuncio', livello, text, luogo: luogo.value.trim(), tutti, canali });
+          },
+        },
+      ],
+    });
+    setTimeout(() => testo.focus(), 60);
   }
 
   // ================================================================ interfaccia
@@ -1359,7 +1813,8 @@
 
     title() {
       const ch = state.channel;
-      if (state.talker && state.talker.id !== state.myId) document.title = `🔴 ${displayName(state.talker)} — ${APP_NAME}`;
+      const t = rx.latest();
+      if (t) document.title = `🔴 ${displayName(t.user)} — ${APP_NAME}`;
       else document.title = ch ? `${ch.nome} — ${APP_NAME}` : APP_NAME;
     },
 
@@ -1392,6 +1847,12 @@
         const body = el('span', 'ch-body');
         body.append(el('span', 'ch-name', c.nome), el('span', 'ch-desc', c.descrizione || ''));
         b.append(el('span', 'ch-ic', c.icona), body);
+        if (!active && disp.active() && !c.eco && disp.linked(c.id)) {
+          b.classList.add('linked');
+          const l = el('span', 'ch-lock', '📡');
+          l.title = 'Collegato: la Centrale parla e ascolta anche qui';
+          b.append(l);
+        }
         if (c.sos) b.append(el('span', 'ch-lock', '🚨'));
         if (c.protetto) b.append(el('span', 'ch-lock', '🔒'));
         const count = el('span', 'ch-count', String(c.utenti));
@@ -1402,28 +1863,44 @@
       }
     },
 
+    // Una persona collegata da più dispositivi (es. PC e telefono) compare una volta sola
+    people() {
+      const groups = new Map();
+      for (const u of state.users.values()) {
+        const key = u.uid || 'c' + u.id;
+        const g = groups.get(key) || { u, n: 0, ids: [] };
+        g.n++;
+        g.ids.push(u.id);
+        groups.set(key, g);
+      }
+      return [...groups.values()];
+    },
+
     users() {
       const bar = $('#userBar');
       bar.textContent = '';
-      const talkId = state.talker && state.talker.id;
-      const list = [...state.users.values()].sort(
-        (a, b) =>
-          (b.id === talkId) - (a.id === talkId) ||
-          (b.id === state.myId) - (a.id === state.myId) ||
-          String(a.nome).localeCompare(String(b.nome), 'it')
-      );
-      for (const u of list) {
-        const r = roleInfo(u.ruolo);
-        const chip = el('span', 'chip' + (u.id === talkId ? ' talking' : '') + (u.id === state.myId ? ' me' : ''));
-        chip.title = `${displayName(u)} — ${r.icona} ${r.nome}`;
+      const talking = rx.talkingIds();
+      if (state.tx === 'on' || state.tx === 'stopping') talking.add(state.myId);
+      const list = this.people().map((g) => ({
+        u: g.u,
+        n: g.n,
+        talk: g.ids.some((id) => talking.has(id)),
+        mine: isMine(g.u) || g.ids.includes(state.myId),
+      }));
+      list.sort((a, b) => b.talk - a.talk || b.mine - a.mine || String(a.u.nome).localeCompare(String(b.u.nome), 'it'));
+      for (const p of list) {
+        const r = roleInfo(p.u.ruolo);
+        const chip = el('span', 'chip' + (p.talk ? ' talking' : '') + (p.mine ? ' me' : ''));
+        chip.title = `${displayName(p.u)} — ${r.icona} ${r.nome}` + (p.n > 1 ? ` (collegato da ${p.n} dispositivi)` : '');
         const dot = el('i');
         dot.style.background = r.colore;
-        chip.append(dot, el('span', null, displayName(u) + (u.id === state.myId ? ' (tu)' : '')));
-        if (u.id === talkId) chip.append(el('span', null, '🎙️'));
+        chip.append(dot, el('span', null, displayName(p.u) + (p.mine ? ' (tu)' : '')));
+        if (p.n > 1) chip.append(el('small', 'chip-n', '×' + p.n));
+        if (p.talk) chip.append(el('span', null, '🎙️'));
         bar.append(chip);
       }
-      const n = state.users.size;
-      $('#chMeta').textContent = state.channel ? `${n} ${n === 1 ? 'utente' : 'utenti'} in canale` : '';
+      const n = list.length;
+      $('#chMeta').textContent = state.channel ? `${n} ${n === 1 ? 'persona' : 'persone'} in canale` : '';
     },
 
     lcd() {
@@ -1436,28 +1913,47 @@
         sub = 'Controlla la connessione internet';
       } else if (state.tx === 'pending') {
         mode = 'tx';
-        top = '● RICHIESTA CANALE';
+        const n = disp.targets().length + 1;
+        top = n > 1 ? '● CENTRALE: RICHIESTA LINEA' : '● RICHIESTA CANALE';
         name = 'Attendi…';
-        sub = ch ? `${ch.icona} ${ch.nome}` : '';
+        sub = n > 1 ? `📡 ${n} canali` : ch ? `${ch.icona} ${ch.nome}` : '';
       } else if (state.tx === 'on' || state.tx === 'stopping') {
         mode = 'tx';
-        top = '● IN TRASMISSIONE';
-        name = 'Stai parlando';
-        const others = Math.max(0, state.users.size - 1);
-        if (ch && ch.eco) sub = '🔁 rilascia e ti risentirai';
-        else if (others === 0) sub = '⚠️ nessuno nel canale ti sta ascoltando';
-        else sub = `👂 ti ${others === 1 ? 'ascolta 1 persona' : `ascoltano ${others} persone`} in diretta`;
+        const info = state.txInfo || {};
+        const people = (k) => `👂 ti ${k === 1 ? 'ascolta 1 persona' : `ascoltano ${k} persone`} in diretta`;
+        if (info.canali > 1) {
+          top = '● CENTRALE IN ONDA';
+          name = `📡 Parli a ${info.canali} canali`;
+          sub = info.ascoltatori ? people(info.ascoltatori) : '⚠️ in questi canali non c\'è nessuno';
+        } else {
+          top = '● IN TRASMISSIONE';
+          name = 'Stai parlando';
+          const others = this.people().filter((g) => !isMine(g.u)).length;
+          if (ch && ch.eco) sub = '🔁 rilascia e ti risentirai';
+          else if (others === 0) sub = '⚠️ nessuno nel canale ti sta ascoltando';
+          else sub = people(others);
+        }
       } else if (Date.now() < state.busyUntil && state.busyBy) {
         mode = 'busy';
-        top = '✖ CANALE OCCUPATO';
+        top = state.busyPrio ? '✖ PARLA LA CENTRALE' : '✖ CANALE OCCUPATO';
         name = displayName(state.busyBy);
-        sub = 'sta già parlando — aspetta il tuo turno';
-      } else if (state.talker) {
-        const r = roleInfo(state.talker.ruolo);
-        mode = 'rx';
-        top = '▶ IN DIRETTA';
-        name = displayName(state.talker);
-        sub = `${r.icona} ${r.nome}`;
+        sub = state.busyPrio ? '📡 comunicazione prioritaria — aspetta che finisca' : 'sta già parlando — aspetta il tuo turno';
+      } else if (rx.latest()) {
+        const t = rx.latest();
+        const r = roleInfo(t.user.ruolo);
+        const more = rx.talks.size > 1 ? ` · +${rx.talks.size - 1}` : '';
+        mode = t.prio ? 'prio' : 'rx';
+        if (t.prio) top = (t.canali > 1 ? `📡 CENTRALE · ${t.canali} CANALI` : '📡 CENTRALE') + more;
+        else if (t.via) top = `👂 ${t.via.icona} ${t.via.nome}` + more;
+        else top = '▶ IN DIRETTA' + more;
+        name = displayName(t.user);
+        sub = `${r.icona} ${r.nome}` + (t.prio && t.origine && !t.eco ? ` · da ${t.origine.icona} ${t.origine.nome}` : '');
+      } else if (disp.active()) {
+        const n = disp.targets().length + 1;
+        mode = 'idle';
+        top = n > 1 ? `📡 COLLEGATO A ${n} CANALI` : '📡 CENTRALE';
+        name = ch ? `${ch.icona} ${ch.nome}` : '—';
+        sub = n === 1 ? 'tocca i canali qui sotto per collegarli' : disp.cfg.ascolta ? '👂 senti anche le risposte dei canali collegati' : '🔇 senti solo questo canale';
       } else {
         mode = 'idle';
         top = 'IN ASCOLTO';
@@ -1469,16 +1965,17 @@
       $('#lcdName').textContent = name;
       $('#lcdSub').textContent = sub;
       this.lcdTime();
-      if (mode === 'rx') this.rxMeter();
+      if (mode === 'rx' || mode === 'prio') this.rxMeter();
       else if (mode !== 'tx') this.meter(0);
     },
 
     lcdTime() {
       let t = '';
+      const r = rx.latest();
       if (state.tx === 'on' || state.tx === 'stopping') {
         t = fmtDur((Date.now() - state.txStart) / 1000) + ' / ' + fmtDur(state.maxTalk);
-      } else if (state.talker && state.tx === 'idle' && state.online) {
-        t = fmtDur((Date.now() - state.talkStart) / 1000);
+      } else if (r && state.tx === 'idle' && state.online) {
+        t = fmtDur((Date.now() - r.start) / 1000);
       } else if (state.online) {
         t = fmtTime(Date.now());
       }
@@ -1489,7 +1986,7 @@
       if (this.rxRaf || !audio.analyser) return;
       const data = new Uint8Array(audio.analyser.fftSize);
       const loop = () => {
-        if (!state.talker || state.talker.id === state.myId || state.tx !== 'idle') {
+        if (!rx.talks.size || state.tx !== 'idle') {
           this.rxRaf = 0;
           return;
         }
@@ -1509,8 +2006,9 @@
       $('#meter').style.width = Math.min(100, level * 350).toFixed(1) + '%';
     },
 
-    busy(by) {
+    busy(by, prio) {
       state.busyBy = by;
+      state.busyPrio = !!prio;
       state.busyUntil = Date.now() + 2000;
       $('#ptt').dataset.state = 'busy';
       this.lcd();
@@ -1535,9 +2033,12 @@
         label = hold ? 'IN ONDA<br>rilascia per chiudere' : 'IN ONDA<br>premi per chiudere';
       } else {
         st = 'idle';
-        label = hold ? 'TIENI PREMUTO<br>PER PARLARE' : 'PREMI<br>PER PARLARE';
+        const n = disp.targets().length + 1;
+        const what = n > 1 ? `PARLA A ${n} CANALI` : 'PER PARLARE';
+        label = (hold ? 'TIENI PREMUTO<br>' : 'PREMI<br>') + what;
       }
       if (!(b.dataset.state === 'busy' && st === 'idle' && Date.now() < state.busyUntil)) b.dataset.state = st;
+      b.dataset.multi = disp.targets().length ? '1' : '';
       $('#pttLabel').innerHTML = label;
       const hint = $('#pttHint');
       hint.textContent = '';
@@ -1562,12 +2063,18 @@
     feedItem(m) {
       if (m.tipo === 'sistema') return el('div', 'msg msg-sistema', `${fmtTime(m.ts)} · ${m.testo}`);
       const mine = isMine(m.from);
-      const item = el('div', `msg msg-${m.tipo}` + (mine ? ' mine' : ''));
+      const lv = m.tipo === 'annuncio' ? ' lv-' + (KINDS[m.livello] ? m.livello : 'info') : '';
+      const item = el('div', `msg msg-${m.tipo}${lv}` + (mine ? ' mine' : '') + (m.prio ? ' prio' : '') + (m.via ? ' via' : ''));
+      if (m.id) item.dataset.id = m.id;
       const r = roleInfo(m.from.ruolo);
       const head = el('div', 'msg-head');
       const dot = el('span', 'dot');
       dot.style.background = r.colore;
-      head.append(dot, el('b', null, displayName(m.from)), el('span', 'rep', `${r.icona} ${r.nome}`), el('time', null, fmtTime(m.ts)));
+      head.append(dot, el('b', null, displayName(m.from)), el('span', 'rep', `${r.icona} ${r.nome}`));
+      // da dove arriva: un canale ascoltato dalla Centrale, o un messaggio mandato a più canali
+      if (m.via) head.append(el('span', 'tag', `👂 dal canale ${m.via.icona} ${m.via.nome}`));
+      if (m.canali > 1) head.append(el('span', 'tag prio', `📡 a ${m.canali} canali`));
+      head.append(el('time', null, fmtTime(m.ts)));
       item.append(head);
       if (m.tipo === 'voce') {
         const row = el('div', 'voice');
@@ -1589,9 +2096,35 @@
         const fromOther = state.channel && m.canale && m.canale.id !== state.channel.id;
         item.append(el('div', 'text', '🚨 ALLERTA SOS' + (fromOther ? ` (da ${m.canale.nome})` : '')));
         item.append(el('div', 'sos-pos', '📍 ' + (m.testo || 'posizione non indicata')));
-        if (m.presoDa && m.presoDa.length) item.append(el('div', 'sos-taken', '✅ ' + m.presoDa.map((p) => p.nome).join(', ')));
+      } else if (m.tipo === 'annuncio') {
+        const K = KINDS[m.livello] || KINDS.info;
+        item.append(el('div', 'ann-title', K.title.replace(/ 🚨$/, '') + ' · ' + canaliText(m).replace('📡 ', '')));
+        item.append(el('div', 'text', m.testo));
+        if (m.luogo) item.append(el('div', 'sos-pos', '📍 ' + m.luogo));
+      }
+      if (m.tipo === 'allerta' || m.tipo === 'annuncio') {
+        item._acks = (m.presoDa || []).map((p) => p.nome);
+        const taken = el('div', 'sos-taken');
+        taken.hidden = !item._acks.length;
+        taken.textContent = '✅ ' + item._acks.join(', ');
+        item.append(taken);
       }
       return item;
+    },
+
+    /** Qualcuno ha risposto «Ricevuto» a un SOS o a un comunicato: aggiorna il messaggio in cronologia */
+    addAck(id, name) {
+      const item = [...$('#feed').children].find((x) => x.dataset.id === id);
+      if (!item || !item._acks || item._acks.includes(name)) return;
+      item._acks.push(name);
+      const taken = item.querySelector('.sos-taken');
+      taken.hidden = false;
+      taken.textContent = '✅ ' + item._acks.join(', ');
+    },
+
+    composer() {
+      const n = disp.targets().length + 1;
+      $('#inText').placeholder = n > 1 ? `Scrivi a ${n} canali (Centrale)…` : 'Scrivi un messaggio al canale…';
     },
 
     feedReset(items) {
@@ -1647,6 +2180,7 @@
       this.onClose = opts.onClose || null;
       $('#modal').classList.toggle('wide', !!opts.wide);
       $('#modal').hidden = false;
+      $('#modalForm').scrollTop = 0; // ogni finestra parte dall'inizio
     },
     async run(a, btn) {
       if (a.onClick) {
@@ -1698,7 +2232,7 @@
       return;
     }
     if (state.tx !== 'idle' || !state.channel) return;
-    if (state.talker && state.talker.id !== state.myId) {
+    if (rx.busyHere()) {
       toast('Aspetta la fine della trasmissione');
       return;
     }
@@ -1706,8 +2240,9 @@
     replayBtn = btn;
     btn.textContent = '■';
     btn.classList.add('on');
+    const chId = (m.via && m.via.id) || state.channel.id; // vocale di un canale ascoltato dalla Centrale
     try {
-      await audio.replay(`/api/msg/${encodeURIComponent(state.channel.id)}/${m.id}.wav?k=${encodeURIComponent(state.key)}`);
+      await audio.replay(`/api/msg/${encodeURIComponent(chId)}/${m.id}.wav?k=${encodeURIComponent(state.key)}`);
     } catch (e) {
       toast(e && e.message === 'gone' ? 'Messaggio non più disponibile' : 'Impossibile riprodurre il messaggio');
     } finally {
@@ -2042,7 +2577,8 @@
     net.close();
     rx.reset();
     audio.stopReplay();
-    sos.close();
+    alarm.close();
+    disp.lastMon = '';
     wake.off();
     modal.close();
     if (RadioApp.admin) RadioApp.admin.hide();
@@ -2142,7 +2678,7 @@
         if (e.key === 'Escape') modal.close();
         return;
       }
-      if (!$('#sosOverlay').hidden && e.key === 'Escape') return sos.close();
+      if (!$('#sosOverlay').hidden && e.key === 'Escape') return alarm.close();
       if (RadioApp.admin && RadioApp.admin.isOpen()) {
         if (e.key === 'Escape') RadioApp.admin.hide();
         return;
@@ -2202,14 +2738,15 @@
       const text = input.value.trim();
       if (!text) return;
       if (!state.online || !state.channel) return toast('Non sei collegato');
-      net.send({ t: 'text', text });
+      const ids = disp.targetIds(); // Centrale con "più canali": il messaggio va a tutti i canali collegati
+      net.send(ids.length ? { t: 'text', text, diramazione: true, canali: ids } : { t: 'text', text });
       input.value = '';
     });
 
     // SOS
-    $('#sosAck').onclick = () => sos.ack();
-    $('#sosRepeat').onclick = () => sos.speak();
-    $('#sosClose').onclick = () => sos.close();
+    $('#sosAck').onclick = () => alarm.ack();
+    $('#sosRepeat').onclick = () => alarm.speak();
+    $('#sosClose').onclick = () => alarm.close();
 
     // Finestre
     $('#modalForm').addEventListener('submit', (e) => {
@@ -2307,7 +2844,7 @@
     admin: null,
   };
   window.RadioApp = RadioApp;
-  window.__radio = { state, audio, settings }; // per diagnosi dalla console del browser
+  window.__radio = { state, audio, settings, rx, disp }; // per diagnosi dalla console del browser
 
   boot(false);
 })();

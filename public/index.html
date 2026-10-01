@@ -118,6 +118,9 @@
           <button class="btn send" type="submit" aria-label="Invia">➤</button>
         </form>
 
+        <!-- Centrale operativa: parla a più canali insieme e manda comunicati (solo con il permesso) -->
+        <section id="dispBar" class="disp" hidden></section>
+
         <section class="controls">
           <button id="btnSos" class="side-btn sos" type="button" title="Allerta SOS"><span>🚨</span><small>SOS</small></button>
           <button id="ptt" class="ptt" type="button" data-state="idle">
@@ -131,14 +134,15 @@
     </main>
   </div>
 
-  <!-- ===================== ALLERTA SOS ===================== -->
-  <div id="sosOverlay" class="sos-overlay" hidden>
-    <div class="sos-card" role="alertdialog" aria-labelledby="sosWho">
-      <div class="sos-title">🚨 SOS 🚨</div>
+  <!-- ===================== ALLERTA SOS / COMUNICATI DELLA CENTRALE ===================== -->
+  <div id="sosOverlay" class="sos-overlay" data-kind="sos" hidden>
+    <div class="sos-card" role="alertdialog" aria-labelledby="sosTitle">
+      <div id="sosTitle" class="sos-title">🚨 SOS 🚨</div>
       <div id="sosWho" class="sos-who"></div>
       <div id="sosRole" class="sos-role"></div>
-      <div class="sos-where-box">
-        <small>📍 POSIZIONE</small>
+      <div id="sosText" class="sos-text" hidden></div>
+      <div id="sosWhereBox" class="sos-where-box">
+        <small id="sosWhereLbl">📍 POSIZIONE</small>
         <div id="sosWhere" class="sos-where"></div>
       </div>
       <div id="sosChan" class="sos-chan"></div>

@@ -1,6 +1,6 @@
 /* Service worker: permette di installare la radio come app sul telefono.
    Usa sempre la versione più recente dal server, la cache serve solo se sei offline. */
-const CACHE = 'radio-urp-v2';
+const CACHE = 'radio-urp-v3';
 const SHELL = [
   './',
   'index.html',

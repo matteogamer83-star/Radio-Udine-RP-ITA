@@ -419,6 +419,98 @@ select.input { appearance: auto; }
   .adm-actions { width: 100%; justify-content: flex-start; }
 }
 
+/* ---------------------------------------------------------------- Centrale operativa (più canali) */
+.disp { flex: none; margin: 2px 0 2px; padding: 8px 10px; border-radius: 14px; background: var(--panel); border: 1px solid var(--line); }
+.disp.on { border-color: #1e5a80; background: linear-gradient(180deg, #0d1c2a, #0b1520); }
+.disp-head { display: flex; align-items: center; gap: 8px; }
+.disp-title { font-size: 11px; letter-spacing: 1.5px; color: #7dd3fc; white-space: nowrap; }
+.disp-sw, .disp-btn {
+  display: flex; align-items: center; gap: 8px; background: var(--bg2); border: 1px solid var(--line); border-radius: 999px;
+  padding: 6px 12px; font-size: 13px; font-weight: 700; white-space: nowrap; flex: none;
+}
+.disp-sw { padding-left: 6px; }
+.disp-sw i { width: 30px; height: 18px; border-radius: 999px; background: #2a3546; position: relative; flex: none; transition: background .15s; }
+.disp-sw i::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%;
+  background: #9aa4b2; transition: transform .15s, background .15s;
+}
+.disp-sw.on { border-color: #38bdf8; color: #e0f2fe; }
+.disp-sw.on i { background: #0284c7; }
+.disp-sw.on i::after { transform: translateX(12px); background: #fff; }
+.disp-sw:hover, .disp-btn:hover { filter: brightness(1.2); }
+.disp-count { font-size: 12px; color: #7dd3fc; white-space: nowrap; }
+.disp-btn { padding: 6px 10px; }
+.disp-btn.on { border-color: #1e5a80; }
+.disp-btn.news { margin-left: auto; background: #2a1d05; border-color: #6b4a0e; color: #ffd98a; }
+.disp-chips { display: flex; gap: 6px; overflow-x: auto; padding: 8px 0 2px; scrollbar-width: thin; }
+.dchip {
+  flex: none; display: flex; align-items: center; gap: 5px; background: var(--bg2); border: 1px solid var(--line);
+  border-radius: 999px; padding: 5px 10px; font-size: 13px; white-space: nowrap; color: var(--muted);
+}
+.dchip small { font-size: 11px; background: #0007; border-radius: 999px; padding: 0 6px; }
+.dchip.on { color: #e0f2fe; border-color: #38bdf8; background: #0c2a40; }
+.dchip.all.on { background: #075985; }
+.dchip.here { cursor: default; border-style: dashed; }
+.dchip.live { box-shadow: 0 0 0 2px #2fd27a99; }
+.dchip.live small { background: var(--rx); color: #04210f; font-weight: 700; }
+@media (max-width: 560px) { .disp-title, .disp-count { display: none; } }
+/* su PC si vedono tutti i canali (vanno a capo), sul telefono si scorrono col dito */
+@media (min-width: 900px) and (min-height: 700px) { .disp-chips { flex-wrap: wrap; overflow: visible; } }
+@media (max-width: 899px), (max-height: 699px) { .disp-chips { scrollbar-width: none; } .disp-chips::-webkit-scrollbar { display: none; } }
+
+.ptt[data-multi="1"][data-state=idle] {
+  background: radial-gradient(circle at 50% 32%, #2d6a93, #0f2a3f 72%);
+  box-shadow: 0 0 0 6px #0b2233, 0 0 0 8px #38bdf8, 0 14px 34px #000b, inset 0 2px 0 #ffffff22;
+}
+.lcd[data-mode=prio] { --c: #bae6fd; background: linear-gradient(180deg, #0a2236, #061624); border-color: #1e6a99; box-shadow: inset 0 0 30px #0009, 0 0 24px #38bdf833; }
+.ch.linked { box-shadow: inset 3px 0 0 #38bdf8; }
+.chip-n { font-size: 11px; color: var(--muted); }
+
+/* messaggi: da un canale ascoltato, a più canali, comunicati */
+.msg-head .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: #0d1a2c; border: 1px solid #234a7a; color: #b9dcff; white-space: nowrap; }
+.msg-head .tag.prio { background: #0c2a40; border-color: #1e6a99; color: #bae6fd; }
+.msg.prio { border-left: 3px solid #38bdf8; }
+.msg.via { background: #0e1622; }
+.ann-title { font-weight: 800; font-size: 12px; margin-top: 5px; letter-spacing: .4px; }
+.msg-annuncio .text { font-weight: 600; font-size: 15px; }
+.msg-annuncio.lv-info { background: #0d1a2c; border-color: #2a5a9a; }
+.msg-annuncio.lv-info .ann-title { color: #93c5fd; }
+.msg-annuncio.lv-allerta { background: #2d1a06; border-color: #b45309; }
+.msg-annuncio.lv-allerta .ann-title { color: #fdba74; }
+.msg-annuncio.lv-emergenza { background: #3b0d0d; border-color: var(--tx); }
+.msg-annuncio.lv-emergenza .ann-title { color: #ffb3b3; }
+
+/* finestra "Comunicato" */
+textarea.input { resize: vertical; min-height: 74px; font: inherit; line-height: 1.4; }
+.seg-lv { width: 100%; }
+.seg-lv button { flex: 1; padding: 8px 4px; }
+.seg-lv button.on.lv-info { background: #0d2a45; color: #bae6fd; }
+.seg-lv button.on.lv-allerta { background: #3a2508; color: #fdba74; }
+.seg-lv button.on.lv-emergenza { background: #4a1010; color: #ffb3b3; }
+.role-checks.dim { opacity: .45; }
+.role-checks.compact { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+.role-checks.compact .chk { padding: 6px 8px; }
+/* i pulsanti delle finestre lunghe restano sempre visibili in basso (coprono anche il margine della finestra) */
+.modal-actions {
+  position: sticky; bottom: -18px; background: var(--panel); z-index: 1;
+  padding: 12px 0 18px; margin: 12px 0 -18px;
+}
+
+/* schermata dei comunicati (stessa dell'SOS, colori diversi) */
+.sos-card { max-height: calc(100vh - 32px); overflow-y: auto; }
+.sos-text { margin-top: 14px; font-size: 20px; font-weight: 800; color: #fff; line-height: 1.35; word-break: break-word; white-space: pre-wrap; }
+.sos-overlay[data-kind=allerta] { background: radial-gradient(circle at 50% 40%, #7a4a0bdd, #1a0f00f2); animation: allbg 1.4s steps(1) infinite; }
+@keyframes allbg { 50% { background: radial-gradient(circle at 50% 40%, #a8640fee, #2a1800f2); } }
+.sos-overlay[data-kind=allerta] .sos-card { border-color: var(--warn); background: #1c1206; box-shadow: 0 0 60px #ffa31a88; }
+.sos-overlay[data-kind=allerta] .sos-title { text-shadow: 0 0 20px var(--warn); font-size: 30px; }
+.sos-overlay[data-kind=allerta] .sos-where-box { border-color: #ffa31a88; }
+.sos-overlay[data-kind=allerta] .sos-where-box small, .sos-overlay[data-kind=allerta] .sos-role, .sos-overlay[data-kind=allerta] .sos-chan { color: #fdba74; }
+.sos-overlay[data-kind=info] { background: #020a14e6; animation: none; }
+.sos-overlay[data-kind=info] .sos-card { border-color: #38bdf8; background: #0b1724; box-shadow: 0 0 50px #38bdf855; }
+.sos-overlay[data-kind=info] .sos-title { font-size: 26px; text-shadow: 0 0 20px #38bdf8; }
+.sos-overlay[data-kind=info] .sos-where-box { border-color: #38bdf888; }
+.sos-overlay[data-kind=info] .sos-where-box small, .sos-overlay[data-kind=info] .sos-role, .sos-overlay[data-kind=info] .sos-chan { color: #bae6fd; }
+
 .toast {
   position: fixed; left: 50%; top: calc(64px + var(--st)); transform: translateX(-50%); pointer-events: none;
   background: #1f2a3b; border: 1px solid #34496a; padding: 10px 16px; border-radius: 12px; z-index: 60;
