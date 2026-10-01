@@ -8,5 +8,9 @@ services:
     startCommand: node server.js
     healthCheckPath: /api/info
     envVars:
-      - key: SERVER_PASSWORD
+      # Token GitHub con permesso "gist": salva account, ruoli e canali in modo permanente
+      - key: GITHUB_TOKEN
+        sync: false
+      # Codice per creare il Founder alla prima accensione (scegline uno tu)
+      - key: SETUP_CODE
         sync: false

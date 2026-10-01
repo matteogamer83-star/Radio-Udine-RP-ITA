@@ -1,21 +1,21 @@
 {
   "nomeServer": "Udine RP ITA",
   "porta": 3000,
-  "passwordServer": "",
   "durataMassimaTrasmissione": 60,
   "messaggiVocaliSalvati": 20,
 
   "canali": [
-    { "id": "generale",       "nome": "Generale",               "icona": "📻", "descrizione": "Canale libero per tutti",                  "password": "" },
-    { "id": "centrale",       "nome": "Centrale Operativa 112", "icona": "🚨", "descrizione": "Coordinamento emergenze e forze dell'ordine", "password": "" },
-    { "id": "polizia",        "nome": "Polizia di Stato",       "icona": "🚓", "descrizione": "Questura di Udine",                        "password": "" },
-    { "id": "carabinieri",    "nome": "Carabinieri",            "icona": "🚔", "descrizione": "Comando Provinciale di Udine",             "password": "" },
-    { "id": "gdf",            "nome": "Guardia di Finanza",     "icona": "🛡️", "descrizione": "Comando Provinciale",                      "password": "" },
-    { "id": "polizia-locale", "nome": "Polizia Locale",         "icona": "🚦", "descrizione": "Comando di Udine",                         "password": "" },
-    { "id": "118",            "nome": "118 Soccorso",           "icona": "🚑", "descrizione": "Emergenza sanitaria",                      "password": "" },
-    { "id": "vvf",            "nome": "Vigili del Fuoco",       "icona": "🚒", "descrizione": "Comando Provinciale",                      "password": "" },
-    { "id": "meccanici",      "nome": "Soccorso Stradale",      "icona": "🔧", "descrizione": "Meccanici e carro attrezzi",               "password": "" },
-    { "id": "staff",          "nome": "Staff",                  "icona": "⭐", "descrizione": "Solo staff del server",                    "password": "staff2026" }
+    { "id": "generale",       "nome": "Generale",               "icona": "📻", "descrizione": "Canale libero per tutti",                     "password": "" },
+    { "id": "centrale",       "nome": "Centrale Operativa 112", "icona": "🚨", "descrizione": "Coordinamento emergenze: riceve tutti gli SOS", "password": "", "riceveSos": true },
+    { "id": "polizia",        "nome": "Polizia di Stato",       "icona": "🚓", "descrizione": "Questura di Udine",                           "password": "" },
+    { "id": "carabinieri",    "nome": "Carabinieri",            "icona": "🚔", "descrizione": "Comando Provinciale di Udine",                "password": "" },
+    { "id": "gdf",            "nome": "Guardia di Finanza",     "icona": "🛡️", "descrizione": "Comando Provinciale",                         "password": "" },
+    { "id": "polizia-locale", "nome": "Polizia Locale",         "icona": "🚦", "descrizione": "Comando di Udine",                            "password": "" },
+    { "id": "118",            "nome": "118 Soccorso",           "icona": "🚑", "descrizione": "Emergenza sanitaria",                         "password": "" },
+    { "id": "vvf",            "nome": "Vigili del Fuoco",       "icona": "🚒", "descrizione": "Comando Provinciale",                         "password": "" },
+    { "id": "meccanici",      "nome": "Soccorso Stradale",      "icona": "🔧", "descrizione": "Meccanici e carro attrezzi",                  "password": "" },
+    { "id": "staff",          "nome": "Staff",                  "icona": "⭐", "descrizione": "Solo staff del server",                       "password": "staff2026", "soloStaff": true },
+    { "id": "prova-audio",    "nome": "Prova audio (eco)",      "icona": "🔁", "descrizione": "Parla e ti risenti subito: prova mic e casse", "password": "", "eco": true }
   ],
 
   "reparti": [
