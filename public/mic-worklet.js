@@ -2,26 +2,36 @@
  * Cattura del microfono (gira nel thread audio del browser).
  * Converte l'audio del microfono (44.1/48 kHz, float) in PCM 16 bit a 16 kHz
  * e lo spedisce all'app a pacchetti da 40 ms.
+ * Lo "stop" può avere una coda (tail) in millisecondi: la registrazione continua ancora
+ * un attimo per non tagliare l'ultima parola. Tutto avviene qui, senza timer della pagina,
+ * così funziona preciso anche con il browser in secondo piano (es. mentre giochi).
  */
 class MicCapture extends AudioWorkletProcessor {
   constructor(options) {
     super();
-    const target = (options && options.processorOptions && options.processorOptions.targetRate) || 16000;
-    this.ratio = sampleRate / target;
-    this.frame = Math.round(target * 0.04);
+    this.target = (options && options.processorOptions && options.processorOptions.targetRate) || 16000;
+    this.ratio = sampleRate / this.target;
+    this.frame = Math.round(this.target * 0.04);
     this.active = false;
     this.sid = 0;
+    this.stopIn = 0;
     this.reset();
     this.port.onmessage = (e) => {
       const msg = e.data || {};
       if (msg.cmd === 'start') {
         this.reset();
         this.sid = msg.sid;
+        this.stopIn = 0;
         this.active = true;
       } else if (msg.cmd === 'stop') {
         if (this.active && msg.sid === this.sid) {
-          this.flush(true);
-          this.active = false;
+          const tail = Math.round((this.target * (msg.tail || 0)) / 1000);
+          if (tail > 0) {
+            this.stopIn = tail;
+          } else {
+            this.flush(true);
+            this.active = false;
+          }
         } else {
           this.port.postMessage({ sid: msg.sid, final: true });
         }
@@ -68,6 +78,11 @@ class MicCapture extends AudioWorkletProcessor {
         else if (s < -1) s = -1;
         this.sumSq += s * s;
         this.out[this.n++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        if (this.stopIn > 0 && --this.stopIn === 0) {
+          this.flush(true);
+          this.active = false;
+          return true;
+        }
         if (this.n === this.frame) this.flush(false);
       }
     }

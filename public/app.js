@@ -29,11 +29,13 @@
     },
     set(k, v) {
       try {
-        localStorage.setItem('radio-urp:' + k, JSON.stringify(v));
+        if (v == null) localStorage.removeItem('radio-urp:' + k);
+        else localStorage.setItem('radio-urp:' + k, JSON.stringify(v));
       } catch (e) {}
     },
   };
 
+  const finePointer = !!(window.matchMedia && matchMedia('(pointer: fine)').matches);
   const DEFAULTS = {
     volume: 1,
     muted: false,
@@ -43,27 +45,33 @@
     beeps: true,
     vibrate: true,
     wakeLock: true,
+    tastoPc: finePointer, // risponde al tasto PTT per Windows
+    notifiche: false,
   };
   const settings = Object.assign({}, DEFAULTS, store.get('settings', {}));
   const saveSettings = () => store.set('settings', settings);
 
   const state = {
     info: null,
-    repartiMap: new Map(),
-    profile: store.get('profile', null),
-    serverPwd: store.get('serverPwd', ''),
+    token: store.get('token', null),
+    pendingAuth: null,
     ws: null,
     online: false,
     loggedIn: false,
     loggedOut: true,
     myId: null,
     key: null,
+    me: null,
+    perms: {},
+    roles: new Map(),
+    serverName: '',
     maxTalk: 60,
     channels: [],
     channel: null,
     users: new Map(),
     chPwd: store.get('chpwd', {}),
     pendingJoin: null,
+    pcKeys: 0,
     talker: null,
     talkStart: 0,
     rxEndTimer: null,
@@ -81,17 +89,18 @@
     busyBy: null,
   };
 
-  function reparto(nome) {
-    return state.repartiMap.get(nome) || { nome: nome || '—', icona: '👤', colore: '#9ca3af' };
+  function roleInfo(id) {
+    return state.roles.get(id) || { id, nome: '—', icona: '👤', colore: '#9ca3af' };
   }
   function displayName(u) {
     if (!u) return '';
     return u.sigla ? `${u.sigla} · ${u.nome}` : u.nome;
   }
   function me() {
-    const p = state.profile || {};
-    return { id: state.myId, nome: p.nome, sigla: p.sigla, reparto: p.reparto };
+    const m = state.me || {};
+    return { id: state.myId, uid: m.uid, nome: m.nome, sigla: m.sigla, ruolo: m.ruolo };
   }
+  const isMine = (u) => !!u && !!state.me && u.uid === state.me.uid;
   function fmtTime(ts) {
     return new Date(ts).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
   }
@@ -123,8 +132,34 @@
     return code;
   }
   function barHeight(id, i) {
-    const c = id.charCodeAt(i % id.length) || 0;
+    const c = String(id).charCodeAt(i % String(id).length) || 0;
     return 18 + ((c * 37 + i * 53) % 82);
+  }
+
+  // ================================================================ sintesi vocale (per gli SOS)
+  let itVoice = null;
+  function pickVoice() {
+    if (!('speechSynthesis' in window)) return;
+    const vs = speechSynthesis.getVoices();
+    itVoice =
+      vs.find((v) => /^it[-_]IT/i.test(v.lang) && /google|natural|online/i.test(v.name)) ||
+      vs.find((v) => /^it/i.test(v.lang)) ||
+      null;
+  }
+  function speak(text) {
+    if (!('speechSynthesis' in window)) return false;
+    try {
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'it-IT';
+      if (itVoice) u.voice = itVoice;
+      u.rate = 0.95;
+      u.volume = 1;
+      speechSynthesis.speak(u);
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   // ================================================================ audio
@@ -142,11 +177,13 @@
   // Versione di riserva della cattura (browser senza AudioWorklet)
   class Downsampler {
     constructor(inRate, outRate, emit) {
+      this.target = outRate;
       this.ratio = inRate / outRate;
       this.frame = Math.round(outRate * 0.04);
       this.emit = emit;
       this.active = false;
       this.sid = 0;
+      this.stopIn = 0;
       this.reset();
     }
     reset() {
@@ -161,11 +198,16 @@
       if (msg.cmd === 'start') {
         this.reset();
         this.sid = msg.sid;
+        this.stopIn = 0;
         this.active = true;
       } else if (msg.cmd === 'stop') {
         if (this.active && msg.sid === this.sid) {
-          this.flush(true);
-          this.active = false;
+          const tail = Math.round((this.target * (msg.tail || 0)) / 1000);
+          if (tail > 0) this.stopIn = tail;
+          else {
+            this.flush(true);
+            this.active = false;
+          }
         } else {
           this.emit({ sid: msg.sid, final: true });
         }
@@ -196,6 +238,11 @@
           else if (s < -1) s = -1;
           this.sumSq += s * s;
           this.out[this.n++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          if (this.stopIn > 0 && --this.stopIn === 0) {
+            this.flush(true);
+            this.active = false;
+            return;
+          }
           if (this.n === this.frame) this.flush(false);
         }
       }
@@ -215,6 +262,7 @@
     capSid: 0,
     replaySrc: null,
     noiseBuf: null,
+    sirenNodes: [],
 
     ensureCtx() {
       if (this.ctx) return this.ctx;
@@ -245,6 +293,10 @@
       this.comp.connect(this.vol);
       this.comp.connect(this.analyser);
       this.vol.connect(c.destination);
+      // uscita separata per la sirena SOS: suona anche se l'audio è su "muto"
+      this.alarmOut = c.createGain();
+      this.alarmOut.gain.value = 1;
+      this.alarmOut.connect(c.destination);
       this.applyFx();
       this.setVolume();
       c.onstatechange = () => ui.audioBanner();
@@ -267,6 +319,11 @@
       s.buffer = b;
       s.connect(c.destination);
       s.start(0);
+      if ('speechSynthesis' in window) {
+        try {
+          speechSynthesis.getVoices();
+        } catch (e) {}
+      }
     },
 
     applyFx() {
@@ -326,7 +383,7 @@
         let node = null;
         if (c.audioWorklet && window.AudioWorkletNode) {
           try {
-            await c.audioWorklet.addModule('mic-worklet.js');
+            await c.audioWorklet.addModule('mic-worklet.js?v=2');
             node = new AudioWorkletNode(c, 'mic-capture', {
               numberOfInputs: 1,
               numberOfOutputs: 1,
@@ -373,8 +430,8 @@
       this.handlers = handlers;
       if (this.capCmd) this.capCmd({ cmd: 'start', sid });
     },
-    stopCapture(sid) {
-      if (this.capCmd) this.capCmd({ cmd: 'stop', sid });
+    stopCapture(sid, tailMs) {
+      if (this.capCmd) this.capCmd({ cmd: 'stop', sid, tail: tailMs || 0 });
     },
     onCapture(d) {
       if (!d || d.sid !== this.capSid || !this.handlers) return;
@@ -383,7 +440,7 @@
       if (d.final) this.handlers.final();
     },
 
-    // Riproduce un pacchetto audio ricevuto (PCM 16 bit, 16 kHz)
+    // Riproduce un pacchetto audio ricevuto in diretta (PCM 16 bit, 16 kHz)
     playPcm(ab) {
       const c = this.ctx;
       if (!c) return;
@@ -413,6 +470,7 @@
       this.playTime += outLen / rate;
       this.sources.add(s);
       s.onended = () => this.sources.delete(s);
+      if (c.state !== 'running') this.resume().then(() => ui.audioBanner());
     },
 
     stopAll() {
@@ -427,7 +485,7 @@
 
     tone(freq, start, dur, opts) {
       const c = this.ctx;
-      if (!c) return;
+      if (!c) return null;
       opts = opts || {};
       const o = c.createOscillator();
       const g = c.createGain();
@@ -439,9 +497,10 @@
       g.gain.setValueAtTime(v, start + Math.max(0.007, dur - 0.012));
       g.gain.linearRampToValueAtTime(0, start + dur);
       o.connect(g);
-      g.connect(this.vol);
+      g.connect(opts.out || this.vol);
       o.start(start);
       o.stop(start + dur + 0.02);
+      return o;
     },
 
     noise(start, dur, vol) {
@@ -497,10 +556,41 @@
       }
     },
 
-    alarm() {
-      if (!this.ctx) return;
-      const t = this.ctx.currentTime + 0.02;
-      for (let i = 0; i < 8; i++) this.tone(i % 2 ? 650 : 960, t + i * 0.32, 0.3, { type: 'sawtooth', vol: 0.11 });
+    // Sirena bitonale dell'SOS (suona anche con l'audio su muto). Ritorna la durata in secondi.
+    siren(seconds) {
+      const c = this.ctx;
+      if (!c) return 0;
+      this.stopSiren();
+      const t0 = c.currentTime + 0.05;
+      const step = 0.45;
+      const n = Math.max(2, Math.round(seconds / step));
+      const end = t0 + n * step;
+      const o = c.createOscillator();
+      const lp = c.createBiquadFilter();
+      const g = c.createGain();
+      o.type = 'square';
+      for (let i = 0; i < n; i++) o.frequency.setValueAtTime(i % 2 ? 660 : 880, t0 + i * step);
+      lp.type = 'lowpass';
+      lp.frequency.value = 2600;
+      g.gain.setValueAtTime(0, t0);
+      g.gain.linearRampToValueAtTime(0.17, t0 + 0.03);
+      g.gain.setValueAtTime(0.17, end - 0.05);
+      g.gain.linearRampToValueAtTime(0, end);
+      o.connect(lp);
+      lp.connect(g);
+      g.connect(this.alarmOut);
+      o.start(t0);
+      o.stop(end + 0.05);
+      this.sirenNodes = [o];
+      return n * step;
+    },
+    stopSiren() {
+      for (const o of this.sirenNodes) {
+        try {
+          o.stop();
+        } catch (e) {}
+      }
+      this.sirenNodes = [];
     },
 
     async replay(url) {
@@ -539,6 +629,9 @@
   };
 
   // ================================================================ rete
+  const pending = new Map();
+  let reqSeq = 0;
+
   const net = {
     connect() {
       clearTimeout(state.reconnectTimer);
@@ -548,8 +641,8 @@
       state.ws = ws;
       ui.status('connecting');
       ws.onopen = () => {
-        const p = state.profile;
-        ws.send(JSON.stringify({ t: 'hello', nome: p.nome, sigla: p.sigla, reparto: p.reparto, password: state.serverPwd }));
+        const msg = state.pendingAuth || { t: 'auth', token: state.token };
+        ws.send(JSON.stringify(Object.assign({}, msg, { tastoPc: !!settings.tastoPc })));
       };
       ws.onmessage = (e) => {
         if (typeof e.data !== 'string') {
@@ -562,7 +655,11 @@
         } catch (err) {
           return;
         }
-        onMessage(m);
+        try {
+          onMessage(m);
+        } catch (err) {
+          console.error('Errore messaggio', m && m.t, err);
+        }
       };
       ws.onclose = () => {
         if (state.ws !== ws) return;
@@ -570,6 +667,11 @@
         const wasOnline = state.online;
         state.online = false;
         clearInterval(state.pingTimer);
+        for (const [, p] of pending) {
+          clearTimeout(p.timer);
+          p.reject(new Error('Connessione persa'));
+        }
+        pending.clear();
         ptt.abort();
         rx.reset();
         ui.status('off');
@@ -578,7 +680,7 @@
         if (state.loggedOut) return;
         if (!state.loggedIn) {
           state.loggedOut = true;
-          loginFail('Server non raggiungibile. Controlla che sia acceso e riprova.');
+          loginFail('Server non raggiungibile. Controlla la connessione e riprova.');
           return;
         }
         if (wasOnline) toast('📡 Connessione persa, mi ricollego…');
@@ -594,6 +696,18 @@
     sendBinary(buf) {
       const ws = state.ws;
       if (ws && ws.readyState === 1 && ws.bufferedAmount < 256 * 1024) ws.send(buf);
+    },
+    request(op, data) {
+      return new Promise((resolve, reject) => {
+        if (!state.online) return reject(new Error('Non sei collegato alla radio.'));
+        const rid = ++reqSeq;
+        const timer = setTimeout(() => {
+          pending.delete(rid);
+          reject(new Error('Il server non risponde, riprova.'));
+        }, 20000);
+        pending.set(rid, { resolve, reject, timer });
+        net.send(Object.assign({}, data || {}, { t: 'req', rid, op }));
+      });
     },
     close() {
       state.loggedOut = true;
@@ -615,13 +729,37 @@
     },
   };
 
+  function applySession(m) {
+    state.me = m.me;
+    state.perms = m.perms || {};
+    state.roles = new Map((m.roles || []).map((r) => [r.id, r]));
+    state.channels = m.channels || [];
+    state.maxTalk = m.maxTalk || 60;
+    state.serverName = m.server || state.serverName;
+    state.pcKeys = m.pcKeys || 0;
+    if (m.channel) state.channel = m.channel;
+    $('#sideServer').textContent = state.serverName;
+    ui.channels();
+    ui.me();
+    ui.header();
+    ui.users();
+    ui.adminButtons();
+    ui.ptt();
+    if (RadioApp.onSession) RadioApp.onSession();
+  }
+
   function onMessage(m) {
     switch (m.t) {
       case 'welcome': {
         state.myId = m.id;
         state.key = m.key;
-        state.maxTalk = m.maxTalk || 60;
-        state.channels = m.channels || [];
+        if (m.token) {
+          state.token = m.token;
+          store.set('token', m.token);
+        }
+        state.pendingAuth = null;
+        applySession(m);
+        store.set('lastName', displayName(m.me));
         state.online = true;
         state.reconnectDelay = 1000;
         clearInterval(state.pingTimer);
@@ -629,15 +767,23 @@
         if (!state.loggedIn) {
           state.loggedIn = true;
           ui.showApp();
+          if (!audio.micOk && audio.micError !== 'insecure') setTimeout(() => state.loggedIn && showMicHelp(), 800);
         }
         ui.status('on');
-        ui.channels();
-        ui.me();
         const last = (state.channel && state.channel.id) || store.get('lastChannel', null);
         if (last && state.channels.some((c) => c.id === last)) join(last, true);
         else joinFallback();
         break;
       }
+      case 'auth_fail':
+        onAuthFail(m);
+        break;
+      case 'kicked':
+        logoutNow(m.msg || 'Sei stato disconnesso.');
+        break;
+      case 'session':
+        applySession(m);
+        break;
       case 'error':
         handleError(m);
         break;
@@ -648,6 +794,16 @@
           if (c) state.channel = c;
         }
         ui.channels();
+        ui.header();
+        break;
+      case 'channel_gone':
+        toast(m.msg || 'Il canale non è più disponibile');
+        rx.reset();
+        state.channel = null;
+        state.users.clear();
+        ui.users();
+        ui.feedReset([]);
+        joinFallback();
         break;
       case 'joined': {
         rx.reset();
@@ -669,6 +825,10 @@
         else ui.lcd();
         break;
       }
+      case 'users':
+        state.users = new Map((m.users || []).map((u) => [u.id, u]));
+        ui.users();
+        break;
       case 'user_join':
         state.users.set(m.user.id, m.user);
         ui.users();
@@ -688,13 +848,16 @@
         break;
       case 'text':
         ui.feedAdd(m.msg);
-        if (m.msg.from.id !== state.myId) {
+        if (!isMine(m.msg.from)) {
           audio.sfx('text');
           vibrate(20);
         }
         break;
       case 'alert':
         onAlert(m.msg);
+        break;
+      case 'sos_ack':
+        onSosAck(m);
         break;
       case 'ptt_ok':
         ptt.onOk();
@@ -705,19 +868,49 @@
       case 'ptt_timeout':
         ptt.onTimeout();
         break;
+      case 'remote_ptt':
+        onRemotePtt(!!m.down);
+        break;
+      case 'pc_key':
+        state.pcKeys = m.n || 0;
+        ui.ptt();
+        if (m.n > 0 && m.nuovo) toast('⌨️ Tasto PTT per PC collegato!');
+        break;
+      case 'res': {
+        const p = pending.get(m.rid);
+        if (!p) return;
+        pending.delete(m.rid);
+        clearTimeout(p.timer);
+        if (m.ok) p.resolve(m.data || {});
+        else p.reject(new Error(m.error || 'Errore'));
+        break;
+      }
+      case 'admin_dirty':
+        if (RadioApp.onAdminDirty) RadioApp.onAdminDirty();
+        break;
     }
+  }
+
+  function onAuthFail(m) {
+    if (m.code === 'token' || m.code === 'disattivato') {
+      state.token = null;
+      store.set('token', null);
+    }
+    if (state.loggedIn) {
+      logoutNow(m.msg);
+      return;
+    }
+    net.close();
+    if (m.code === 'token') showView('login');
+    if (m.code === 'setup_done') {
+      boot(true);
+      return;
+    }
+    loginFail(m.msg || 'Accesso non riuscito');
   }
 
   function handleError(m) {
     switch (m.code) {
-      case 'server_password':
-        state.serverPwd = '';
-        store.set('serverPwd', '');
-        net.close();
-        if (state.loggedIn) showLogin();
-        $('#pwdField').hidden = false;
-        loginFail(m.msg || 'Codice di accesso errato');
-        break;
       case 'channel_password': {
         const pj = state.pendingJoin;
         state.pendingJoin = null;
@@ -730,6 +923,11 @@
         if (ch && pj && !pj.auto) askChannelPassword(ch, !!pj.password);
         break;
       }
+      case 'no_channel':
+        state.pendingJoin = null;
+        if (!state.channel) joinFallback();
+        else toast(m.msg);
+        break;
       default:
         toast(m.msg || 'Errore');
     }
@@ -758,7 +956,7 @@
   }
 
   function joinFallback() {
-    const c = state.channels.find((x) => !x.protetto);
+    const c = state.channels.find((x) => !x.protetto && !x.eco) || state.channels.find((x) => !x.protetto);
     if (c) sendJoin(c.id, '', true);
   }
 
@@ -791,7 +989,7 @@
     setTimeout(() => input.focus(), 60);
   }
 
-  // ================================================================ ricezione
+  // ================================================================ ricezione (in diretta)
   const rx = {
     start(user, silent) {
       clearTimeout(state.rxEndTimer);
@@ -908,12 +1106,10 @@
       if (state.tx !== 'on') return;
       state.tx = 'stopping';
       const sid = this.sid;
+      // la coda (per non tagliare l'ultima parola) la gestisce il thread audio: funziona anche in secondo piano
+      audio.stopCapture(sid, 160);
       clearTimeout(state.stopTimer);
-      // piccola coda per non tagliare l'ultima parola
-      state.stopTimer = setTimeout(() => {
-        audio.stopCapture(sid);
-        state.stopTimer = setTimeout(() => this.onFinal(sid), 700);
-      }, 150);
+      state.stopTimer = setTimeout(() => this.onFinal(sid), 1500); // riserva
     },
 
     onFinal(sid) {
@@ -964,6 +1160,21 @@
     },
   };
 
+  // Tasto PTT per Windows (programmino che funziona anche col gioco in primo piano)
+  function onRemotePtt(down) {
+    if (!settings.tastoPc || !state.loggedIn) return;
+    if (down) {
+      if (settings.pttMode === 'toggle') ptt.toggle();
+      else if (state.tx === 'idle') {
+        state.pttSource = 'remote';
+        ptt.down();
+      }
+    } else if (settings.pttMode === 'hold' && state.pttSource === 'remote') {
+      state.pttSource = null;
+      ptt.up();
+    }
+  }
+
   // Registra 3 secondi e li fa riascoltare (solo in locale, niente viene inviato)
   const micTest = {
     running: false,
@@ -1001,6 +1212,127 @@
     },
   };
 
+  // ================================================================ SOS
+  const sos = {
+    current: null,
+    timer: 0,
+    show(m) {
+      this.current = m;
+      const r = roleInfo(m.from.ruolo);
+      $('#sosWho').textContent = displayName(m.from);
+      $('#sosRole').textContent = `${r.icona} ${r.nome}`;
+      $('#sosWhere').textContent = m.testo || 'Posizione non indicata';
+      $('#sosWhere').classList.toggle('missing', !m.testo);
+      $('#sosChan').textContent = `Canale: ${m.canale.icona} ${m.canale.nome}`;
+      $('#sosAcks').textContent = '';
+      const b = $('#sosAck');
+      b.disabled = false;
+      b.textContent = '✅ Ricevuto, intervengo';
+      $('#sosOverlay').hidden = false;
+      audio.resume();
+      const dur = audio.siren(4);
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => this.speak(), dur * 1000 + 300);
+      vibrate([400, 150, 400, 150, 800]);
+      notifySos(m);
+    },
+    speak() {
+      const m = this.current;
+      if (!m) return;
+      const r = roleInfo(m.from.ruolo);
+      const chi = (m.from.sigla ? m.from.sigla + ', ' : '') + m.from.nome;
+      const dove = m.testo ? `Posizione: ${m.testo}. Ripeto: ${m.testo}.` : 'Posizione non indicata.';
+      speak(`Attenzione! S O S da ${chi}, ${r.nome}. ${dove} Canale ${m.canale.nome}.`);
+    },
+    ack() {
+      if (!this.current) return;
+      net.send({ t: 'sos_ack', id: this.current.id });
+      const b = $('#sosAck');
+      b.disabled = true;
+      b.textContent = '✅ Hai risposto all\'SOS';
+    },
+    addAck(text) {
+      $('#sosAcks').append(el('div', null, '✅ ' + text));
+    },
+    close() {
+      clearTimeout(this.timer);
+      $('#sosOverlay').hidden = true;
+      this.current = null;
+      audio.stopSiren();
+      if ('speechSynthesis' in window) {
+        try {
+          speechSynthesis.cancel();
+        } catch (e) {}
+      }
+    },
+  };
+
+  function notifySos(m) {
+    if (!settings.notifiche || !('Notification' in window) || Notification.permission !== 'granted' || !document.hidden) return;
+    const title = `🚨 SOS — ${displayName(m.from)}`;
+    const opts = { body: `📍 ${m.testo || 'Posizione non indicata'} · ${m.canale.nome}`, tag: m.id, requireInteraction: true, icon: 'icons/icon-192.png' };
+    const fallback = () => {
+      try {
+        new Notification(title, opts);
+      } catch (e) {}
+    };
+    if (navigator.serviceWorker && navigator.serviceWorker.ready) {
+      navigator.serviceWorker.ready.then((reg) => reg.showNotification(title, opts)).catch(fallback);
+    } else fallback();
+  }
+
+  function flashApp() {
+    const app = $('#app');
+    app.classList.remove('sos-flash');
+    void app.offsetWidth;
+    app.classList.add('sos-flash');
+    setTimeout(() => app.classList.remove('sos-flash'), 3200);
+  }
+
+  function onAlert(m) {
+    ui.feedAdd(m);
+    flashApp();
+    if (isMine(m.from)) {
+      audio.sfx('permit');
+      toast('🚨 SOS inviato: sirena e posizione arrivano a tutto il canale e alla Centrale', 5000);
+      return;
+    }
+    sos.show(m);
+  }
+
+  function onSosAck(m) {
+    const mineAck = isMine(m.by);
+    ui.system(`✅ ${displayName(m.by)} ha risposto all'SOS di ${displayName(m.alert.from)}`);
+    if (sos.current && sos.current.id === m.id) sos.addAck(displayName(m.by) + (mineAck ? ' (tu)' : ''));
+    if (isMine(m.alert.from) && !mineAck) {
+      toast(`✅ ${displayName(m.by)} ha ricevuto il tuo SOS e sta intervenendo`, 7000);
+      audio.sfx('permit');
+      speak(`${m.by.nome} ha ricevuto il tuo S O S.`);
+    }
+  }
+
+  function openSos() {
+    if (!state.channel || !state.online) return toast('Non sei collegato a nessun canale');
+    const input = el('input', 'input');
+    input.maxLength = 120;
+    input.placeholder = 'es. Piazza Libertà, vicino alla stazione';
+    const body = el('div');
+    body.append(
+      el('p', null, `Tutti in ${state.channel.icona} ${state.channel.nome} (e la Centrale) sentiranno la sirena e una voce che legge la tua posizione.`),
+      el('label', 'mini-label', '📍 Dove ti trovi?'),
+      input
+    );
+    modal.open({
+      title: '🚨 Allerta SOS',
+      body,
+      actions: [
+        { label: 'Annulla' },
+        { label: '🚨 INVIA SOS', cls: 'btn-danger', primary: true, onClick: () => net.send({ t: 'alert', text: input.value }) },
+      ],
+    });
+    setTimeout(() => input.focus(), 60);
+  }
+
   // ================================================================ interfaccia
   const ui = {
     rxRaf: 0,
@@ -1034,13 +1366,20 @@
     me() {
       const box = $('#meBox');
       box.textContent = '';
-      const u = me();
-      const r = reparto(u.reparto);
+      if (!state.me) return;
+      const r = roleInfo(state.me.ruolo);
       const dot = el('i');
       dot.style.background = r.colore;
       const txt = el('div');
-      txt.append(el('b', null, displayName(u)), el('small', null, `${r.icona} ${r.nome}`));
+      txt.append(el('b', null, displayName(state.me)), el('small', null, `${r.icona} ${r.nome} · @${state.me.username}`));
       box.append(dot, txt);
+    },
+
+    adminButtons() {
+      const p = state.perms || {};
+      const show = !!(p.founder || p.utenti || p.canali);
+      $('#btnAdmin').hidden = !show;
+      $('#btnAdminSide').hidden = !show;
     },
 
     channels() {
@@ -1053,6 +1392,7 @@
         const body = el('span', 'ch-body');
         body.append(el('span', 'ch-name', c.nome), el('span', 'ch-desc', c.descrizione || ''));
         b.append(el('span', 'ch-ic', c.icona), body);
+        if (c.sos) b.append(el('span', 'ch-lock', '🚨'));
         if (c.protetto) b.append(el('span', 'ch-lock', '🔒'));
         const count = el('span', 'ch-count', String(c.utenti));
         count.title = c.attivo ? 'Qualcuno sta parlando' : 'Utenti nel canale';
@@ -1070,10 +1410,10 @@
         (a, b) =>
           (b.id === talkId) - (a.id === talkId) ||
           (b.id === state.myId) - (a.id === state.myId) ||
-          a.nome.localeCompare(b.nome, 'it')
+          String(a.nome).localeCompare(String(b.nome), 'it')
       );
       for (const u of list) {
-        const r = reparto(u.reparto);
+        const r = roleInfo(u.ruolo);
         const chip = el('span', 'chip' + (u.id === talkId ? ' talking' : '') + (u.id === state.myId ? ' me' : ''));
         chip.title = `${displayName(u)} — ${r.icona} ${r.nome}`;
         const dot = el('i');
@@ -1103,16 +1443,19 @@
         mode = 'tx';
         top = '● IN TRASMISSIONE';
         name = 'Stai parlando';
-        sub = ch ? `su ${ch.icona} ${ch.nome}` : '';
+        const others = Math.max(0, state.users.size - 1);
+        if (ch && ch.eco) sub = '🔁 rilascia e ti risentirai';
+        else if (others === 0) sub = '⚠️ nessuno nel canale ti sta ascoltando';
+        else sub = `👂 ti ${others === 1 ? 'ascolta 1 persona' : `ascoltano ${others} persone`} in diretta`;
       } else if (Date.now() < state.busyUntil && state.busyBy) {
         mode = 'busy';
         top = '✖ CANALE OCCUPATO';
         name = displayName(state.busyBy);
         sub = 'sta già parlando — aspetta il tuo turno';
       } else if (state.talker) {
-        const r = reparto(state.talker.reparto);
+        const r = roleInfo(state.talker.ruolo);
         mode = 'rx';
-        top = '▶ RICEZIONE';
+        top = '▶ IN DIRETTA';
         name = displayName(state.talker);
         sub = `${r.icona} ${r.nome}`;
       } else {
@@ -1169,8 +1512,7 @@
     busy(by) {
       state.busyBy = by;
       state.busyUntil = Date.now() + 2000;
-      const b = $('#ptt');
-      b.dataset.state = 'busy';
+      $('#ptt').dataset.state = 'busy';
       this.lcd();
       setTimeout(() => {
         this.ptt();
@@ -1199,8 +1541,10 @@
       $('#pttLabel').innerHTML = label;
       const hint = $('#pttHint');
       hint.textContent = '';
-      if (audio.micOk && window.matchMedia && matchMedia('(pointer: fine)').matches) {
+      $('#pcKey').hidden = !(state.pcKeys > 0 && settings.tastoPc);
+      if (audio.micOk && finePointer) {
         hint.append(hold ? 'Da tastiera: tieni premuto ' : 'Da tastiera: premi ', el('kbd', null, keyName(settings.pttKey)));
+        if (state.pcKeys > 0 && settings.tastoPc) hint.append(' · ⌨️ tasto PC collegato (funziona anche in gioco)');
       }
     },
 
@@ -1217,9 +1561,9 @@
 
     feedItem(m) {
       if (m.tipo === 'sistema') return el('div', 'msg msg-sistema', `${fmtTime(m.ts)} · ${m.testo}`);
-      const mine = m.from && m.from.id === state.myId;
+      const mine = isMine(m.from);
       const item = el('div', `msg msg-${m.tipo}` + (mine ? ' mine' : ''));
-      const r = reparto(m.from.reparto);
+      const r = roleInfo(m.from.ruolo);
       const head = el('div', 'msg-head');
       const dot = el('span', 'dot');
       dot.style.background = r.colore;
@@ -1242,7 +1586,10 @@
       } else if (m.tipo === 'testo') {
         item.append(el('div', 'text', m.testo));
       } else if (m.tipo === 'allerta') {
-        item.append(el('div', 'text', '🚨 ALLERTA SOS' + (m.testo ? ' — ' + m.testo : '')));
+        const fromOther = state.channel && m.canale && m.canale.id !== state.channel.id;
+        item.append(el('div', 'text', '🚨 ALLERTA SOS' + (fromOther ? ` (da ${m.canale.nome})` : '')));
+        item.append(el('div', 'sos-pos', '📍 ' + (m.testo || 'posizione non indicata')));
+        if (m.presoDa && m.presoDa.length) item.append(el('div', 'sos-taken', '✅ ' + m.presoDa.map((p) => p.nome).join(', ')));
       }
       return item;
     },
@@ -1250,7 +1597,7 @@
     feedReset(items) {
       const f = $('#feed');
       f.textContent = '';
-      if (!items.length) f.append(el('div', 'feed-empty', '📭 Nessun messaggio recente in questo canale.\nTieni premuto il pulsante per parlare.'));
+      if (!items.length) f.append(el('div', 'feed-empty', '📭 Nessun messaggio recente in questo canale.\nTieni premuto il pulsante per parlare: gli altri ti sentono in diretta.'));
       for (const m of items) f.append(this.feedItem(m));
       f.scrollTop = f.scrollHeight;
     },
@@ -1262,7 +1609,7 @@
       if (empty) empty.remove();
       f.append(this.feedItem(m));
       while (f.children.length > 200) f.firstChild.remove();
-      if (nearBottom || (m.from && m.from.id === state.myId)) f.scrollTop = f.scrollHeight;
+      if (nearBottom || isMine(m.from)) f.scrollTop = f.scrollHeight;
     },
 
     system(text) {
@@ -1294,14 +1641,27 @@
       for (const a of this.actions) {
         const b = el('button', 'btn ' + (a.cls || ''), a.label);
         b.type = 'button';
-        b.onclick = () => this.run(a);
+        b.onclick = () => this.run(a, b);
         box.append(b);
       }
       this.onClose = opts.onClose || null;
+      $('#modal').classList.toggle('wide', !!opts.wide);
       $('#modal').hidden = false;
     },
-    run(a) {
-      if (a.onClick && a.onClick() === false) return;
+    async run(a, btn) {
+      if (a.onClick) {
+        let r;
+        try {
+          if (btn) btn.disabled = true;
+          r = await a.onClick();
+        } catch (e) {
+          toast('❌ ' + (e && e.message ? e.message : 'Errore'), 5000);
+          r = false;
+        } finally {
+          if (btn) btn.disabled = false;
+        }
+        if (r === false) return;
+      }
       this.close();
     },
     submit() {
@@ -1357,47 +1717,10 @@
     }
   }
 
-  function onAlert(m) {
-    ui.feedAdd(m);
-    const mine = m.from.id === state.myId;
-    if (mine) {
-      audio.sfx('permit');
-      toast('🚨 SOS inviato a tutto il canale');
-    } else {
-      audio.resume();
-      audio.alarm();
-      vibrate([300, 120, 300, 120, 600]);
-      toast(`🚨 SOS da ${displayName(m.from)}${m.testo ? ' — ' + m.testo : ''}`, 6000);
-    }
-    const app = $('#app');
-    app.classList.remove('sos-flash');
-    void app.offsetWidth;
-    app.classList.add('sos-flash');
-    setTimeout(() => app.classList.remove('sos-flash'), 3200);
-  }
-
-  function openSos() {
-    if (!state.channel || !state.online) return toast('Non sei collegato a nessun canale');
-    const input = el('input', 'input');
-    input.maxLength = 120;
-    input.placeholder = 'Posizione / motivo (facoltativo)';
-    const body = el('div');
-    body.append(el('p', null, `Invierai un'ALLERTA SOS con sirena a tutti gli utenti di ${state.channel.icona} ${state.channel.nome}.`), input);
-    modal.open({
-      title: '🚨 Allerta SOS',
-      body,
-      actions: [
-        { label: 'Annulla' },
-        { label: '🚨 INVIA SOS', cls: 'btn-danger', primary: true, onClick: () => net.send({ t: 'alert', text: input.value }) },
-      ],
-    });
-    setTimeout(() => input.focus(), 60);
-  }
-
   function showMicHelp() {
     const msgs = {
       insecure:
-        'Il microfono funziona solo con un indirizzo sicuro che inizia con https:// (oppure aprendo la radio sul PC del server da http://localhost). Chiedi allo staff il link https corretto. Intanto puoi ascoltare.',
+        'Il microfono funziona solo con un indirizzo sicuro che inizia con https:// (oppure aprendo la radio sul PC del server da http://localhost). Intanto puoi ascoltare.',
       denied:
         "Il permesso del microfono è bloccato. Tocca il lucchetto 🔒 accanto all'indirizzo, metti Microfono su «Consenti» e poi premi Riprova.",
       notfound: 'Non trovo nessun microfono. Collega un microfono o delle cuffie con microfono e premi Riprova.',
@@ -1416,6 +1739,87 @@
     else setTimeout(showMicHelp, 300);
   }
 
+  // ---------------------------------------------------------------- tasto PTT per Windows
+  async function downloadPcKey() {
+    const { token } = await net.request('ptt_token');
+    const res = await fetch('ptt-helper.txt', { cache: 'no-store' });
+    if (!res.ok) throw new Error('File del tasto non trovato sul server');
+    const tpl = await res.text();
+    const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+    const ascii = (s) =>
+      String(s || '')
+        .normalize('NFD')
+        .replace(/[̀-ͯ]/g, '')
+        .replace(/[^\x20-\x7E]/g, '')
+        .replace(/['"`$%^&|<>]/g, '');
+    const text = tpl
+      .split('__SERVER__').join(ascii(wsUrl))
+      .split('__TOKEN__').join(ascii(token))
+      .split('__NOME__').join(ascii(displayName(state.me)) || 'utente')
+      .replace(/\r?\n/g, '\r\n');
+    const blob = new Blob([text], { type: 'application/octet-stream' });
+    const a = el('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'Radio-Udine-RP-Tasto.bat';
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    if (!settings.tastoPc) {
+      settings.tastoPc = true;
+      saveSettings();
+      net.send({ t: 'set_remote', on: true });
+    }
+    const steps = el('ol', 'steps');
+    for (const s of [
+      'Apri il file scaricato «Radio-Udine-RP-Tasto.bat».',
+      'Se Windows mostra «PC protetto da Windows», clicca «Ulteriori informazioni» e poi «Esegui comunque».',
+      'Nella finestra nera premi il tasto che vuoi usare per parlare (consigliato: un tasto laterale del mouse o un tasto che il gioco non usa).',
+      'Lascia aperte la finestra nera e questa radio nel browser (anche ridotta a icona).',
+      'Ora tieni premuto quel tasto anche dentro al gioco: parli in radio!',
+    ]) steps.append(el('li', null, s));
+    const body = el('div');
+    body.append(steps, el('p', 'muted small', 'Il file contiene il tuo codice personale: non condividerlo. Funziona su Windows 10 e 11.'));
+    modal.open({ title: '⌨️ Tasto PTT per PC scaricato', body, actions: [{ label: 'Ho capito', cls: 'btn-primary', primary: true }] });
+  }
+
+  function changePassword() {
+    const mk = (ph, ac) => {
+      const i = el('input', 'input');
+      i.type = 'password';
+      i.placeholder = ph;
+      i.autocomplete = ac;
+      return i;
+    };
+    const old = mk('Password attuale', 'current-password');
+    const nw = mk('Nuova password (almeno 6 caratteri)', 'new-password');
+    const nw2 = mk('Ripeti la nuova password', 'new-password');
+    const body = el('div', 'stack');
+    body.append(old, nw, nw2);
+    modal.open({
+      title: '🔑 Cambia password',
+      body,
+      actions: [
+        { label: 'Annulla' },
+        {
+          label: 'Salva',
+          cls: 'btn-primary',
+          primary: true,
+          onClick: async () => {
+            if (nw.value !== nw2.value) throw new Error('Le due password nuove non sono uguali');
+            const r = await net.request('my_password', { old: old.value, password: nw.value });
+            if (r.token) {
+              state.token = r.token;
+              store.set('token', r.token);
+            }
+            toast('🔑 Password cambiata');
+          },
+        },
+      ],
+    });
+    setTimeout(() => old.focus(), 60);
+  }
+
   function openSettings() {
     const wrap = el('div');
     const row = (label, control, hint) => {
@@ -1432,11 +1836,13 @@
       cb.onchange = () => {
         settings[key] = cb.checked;
         saveSettings();
-        if (after) after();
+        if (after) after(cb);
       };
       return cb;
     };
+    const section = (t) => wrap.append(el('div', 'set-section', t));
 
+    section('Audio');
     const vol = el('input');
     vol.type = 'range';
     vol.min = '0';
@@ -1452,7 +1858,13 @@
     };
     wrap.append(row('🔊 Volume', vol));
     wrap.append(row('📻 Effetto radio', check('radioFx', () => audio.applyFx()), 'Filtro e fruscio da walkie-talkie'));
+    wrap.append(row('🔔 Suoni di sistema', check('beeps'), 'Beep di inizio/fine trasmissione'));
+    const testBtn = el('button', 'btn', '🎙️ Prova microfono');
+    testBtn.type = 'button';
+    testBtn.onclick = () => micTest.run(testBtn);
+    wrap.append(row('Microfono', testBtn, audio.micOk ? '✅ attivo — per la prova completa usa il canale «Prova audio»' : '❌ non attivo'));
 
+    section('Pulsante per parlare');
     const seg = el('div', 'seg');
     for (const [v, label] of [['hold', 'Tieni premuto'], ['toggle', 'Premi 1 volta']]) {
       const b = el('button', settings.pttMode === v ? 'on' : '', label);
@@ -1465,8 +1877,7 @@
       };
       seg.append(b);
     }
-    wrap.append(row('🎙️ Pulsante', seg));
-
+    wrap.append(row('🎙️ Modalità', seg));
     const keyBtn = el('button', 'btn', keyName(settings.pttKey));
     keyBtn.type = 'button';
     keyBtn.onclick = () => {
@@ -1480,27 +1891,74 @@
         keyBtn.textContent = keyName(settings.pttKey);
       };
     };
-    wrap.append(row('⌨️ Tasto per parlare', keyBtn, 'Funziona quando questa finestra è in primo piano'));
-    wrap.append(row('🔔 Suoni di sistema', check('beeps'), 'Beep di inizio/fine trasmissione'));
+    wrap.append(row('⌨️ Tasto nel browser', keyBtn, 'Funziona solo con questa finestra in primo piano'));
+
+    const dl = el('button', 'btn btn-primary', '⬇️ Scarica');
+    dl.type = 'button';
+    dl.onclick = async () => {
+      dl.disabled = true;
+      try {
+        await downloadPcKey();
+      } catch (e) {
+        toast('❌ ' + e.message, 5000);
+      } finally {
+        dl.disabled = false;
+      }
+    };
+    wrap.append(row('🎮 Tasto PTT anche in gioco (Windows)', dl, 'Programmino per parlare tenendo premuto un tasto anche quando sei dentro al gioco'));
+    wrap.append(
+      row('Questo browser risponde al tasto PC', check('tastoPc', () => {
+        net.send({ t: 'set_remote', on: !!settings.tastoPc });
+        ui.ptt();
+      }), state.pcKeys > 0 ? '⌨️ tasto collegato adesso' : 'Disattivalo sul telefono se usi il tasto sul PC')
+    );
+
+    section('Telefono e avvisi');
+    if (installEvt) {
+      const ib = el('button', 'btn btn-primary', '📲 Installa');
+      ib.type = 'button';
+      ib.onclick = () => {
+        modal.close();
+        installApp();
+      };
+      wrap.append(row('Installa la radio come app', ib, 'Icona nella schermata Home, si apre a schermo intero'));
+    }
     wrap.append(row('📳 Vibrazione', check('vibrate')));
     wrap.append(
       row('💡 Schermo sempre acceso', check('wakeLock', () => (settings.wakeLock ? wake.on() : wake.off())), 'Evita che il telefono si blocchi e smetta di ricevere')
     );
+    wrap.append(
+      row('🚨 Notifiche SOS', check('notifiche', async (cb) => {
+        if (!cb.checked) return;
+        if (!('Notification' in window)) {
+          toast('Questo browser non supporta le notifiche');
+          cb.checked = settings.notifiche = false;
+          saveSettings();
+          return;
+        }
+        const p = await Notification.requestPermission().catch(() => 'denied');
+        if (p !== 'granted') {
+          toast('Notifiche bloccate dal browser');
+          cb.checked = settings.notifiche = false;
+          saveSettings();
+        }
+      }), 'Avviso sul desktop se arriva un SOS mentre la radio è in secondo piano')
+    );
 
-    const testBtn = el('button', 'btn', '🎙️ Prova microfono');
-    testBtn.type = 'button';
-    testBtn.onclick = () => micTest.run(testBtn);
-    wrap.append(row('Microfono', testBtn, audio.micOk ? '✅ attivo' : '❌ non attivo'));
-
-    const u = me();
-    const prof = el('span', null, `👤 ${displayName(u)}`);
+    section('Account');
+    const u = state.me || {};
+    const r = roleInfo(u.ruolo);
+    const pw = el('button', 'btn', '🔑 Cambia password');
+    pw.type = 'button';
+    pw.onclick = () => changePassword();
+    wrap.append(row(`👤 ${displayName(u)}`, pw, `@${u.username} · ${r.icona} ${r.nome}`));
     const logout = el('button', 'btn btn-danger', 'Esci');
     logout.type = 'button';
     logout.onclick = () => {
       modal.close();
-      logoutNow();
+      logoutNow('');
     };
-    wrap.append(row(prof, logout, reparto(u.reparto).nome));
+    wrap.append(row('Esci dalla radio su questo dispositivo', logout));
 
     modal.open({
       title: '⚙️ Impostazioni',
@@ -1529,64 +1987,122 @@
   };
 
   // ================================================================ accesso
-  async function onLogin(e) {
-    e.preventDefault();
-    const nome = $('#inNome').value.trim();
-    if (nome.length < 2) return loginFail('Scrivi il tuo nome RP (almeno 2 lettere)');
-    state.profile = { nome, sigla: $('#inSigla').value.trim(), reparto: $('#inReparto').value };
-    store.set('profile', state.profile);
-    state.serverPwd = $('#inPwd').value;
-    store.set('serverPwd', state.serverPwd);
-    loginFail('');
+  function showView(v) {
+    $('#loadingBox').hidden = v !== 'loading';
+    $('#loginForm').hidden = v !== 'login';
+    $('#resumeForm').hidden = v !== 'resume';
+    $('#setupForm').hidden = v !== 'setup';
+    $('#btnRetry').hidden = v !== 'error';
+    if (v === 'resume') $('#resumeName').textContent = store.get('lastName', '') || 'operatore';
+    if (v === 'login') setTimeout(() => (($('#inUser').value ? $('#inPass') : $('#inUser')).focus()), 50);
+  }
 
+  function setBusy(text) {
+    document.querySelectorAll('.btn-go').forEach((b) => {
+      if (!b.dataset.label) b.dataset.label = b.textContent;
+      b.disabled = true;
+      b.textContent = text;
+    });
+  }
+
+  function loginFail(msg) {
+    $('#loginErr').textContent = msg || '';
+    document.querySelectorAll('.btn-go').forEach((b) => {
+      b.disabled = false;
+      if (b.dataset.label) b.textContent = b.dataset.label;
+    });
+  }
+
+  async function start(authMsg) {
+    loginFail('');
     try {
       audio.unlock(); // deve avvenire subito, dentro il click
     } catch (err) {
       return loginFail('Il tuo browser non supporta l\'audio. Usa Chrome, Edge, Firefox o Safari aggiornati.');
     }
-    const btn = $('#btnLogin');
-    btn.disabled = true;
-    btn.textContent = '🎙️ Attivo il microfono…';
-    const micOk = await audio.initMic();
-    btn.textContent = '📡 Connessione…';
+    setBusy('🎙️ Attivo il microfono…');
+    await audio.initMic();
+    setBusy('📡 Connessione…');
+    state.pendingAuth = authMsg;
     state.loggedOut = false;
+    if (state.ws) {
+      const old = state.ws;
+      state.ws = null;
+      try {
+        old.close();
+      } catch (e) {}
+    }
     net.connect();
     wake.on();
     ui.speaker();
-    if (!micOk && audio.micError !== 'insecure') setTimeout(() => state.loggedIn && showMicHelp(), 800);
   }
 
-  function loginFail(msg) {
-    $('#loginErr').textContent = msg;
-    const btn = $('#btnLogin');
-    btn.disabled = false;
-    btn.textContent = '📻 Accendi la radio';
-  }
-
-  function showLogin() {
-    state.loggedIn = false;
-    $('#app').hidden = true;
-    $('#login').hidden = false;
-    loginFail('');
-  }
-
-  function logoutNow() {
+  function logoutNow(msg) {
     ptt.abort();
     net.close();
     rx.reset();
     audio.stopReplay();
+    sos.close();
     wake.off();
+    modal.close();
+    if (RadioApp.admin) RadioApp.admin.hide();
+    state.loggedIn = false;
     state.channel = null;
     state.users.clear();
-    showLogin();
+    state.token = null;
+    store.set('token', null);
+    $('#app').hidden = true;
+    $('#login').hidden = false;
     ui.status('off');
+    showView(state.info && state.info.setup ? 'setup' : 'login');
+    loginFail(msg || '');
   }
 
   // ================================================================ eventi
   let keyCapture = null;
+  let installEvt = null;
+
+  async function installApp() {
+    if (!installEvt) return;
+    installEvt.prompt();
+    try {
+      await installEvt.userChoice;
+    } catch (err) {}
+    installEvt = null;
+    $('#btnInstall').hidden = true;
+  }
 
   function bindEvents() {
-    $('#loginForm').addEventListener('submit', onLogin);
+    $('#loginForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const username = $('#inUser').value.trim().toLowerCase();
+      const password = $('#inPass').value;
+      if (!username || !password) return loginFail('Scrivi nome utente e password');
+      start({ t: 'login', username, password });
+      $('#inPass').value = '';
+    });
+    $('#resumeForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (!state.token) return showView('login');
+      start({ t: 'auth', token: state.token });
+    });
+    $('#btnSwitch').onclick = () => {
+      state.token = null;
+      store.set('token', null);
+      showView('login');
+    };
+    $('#setupForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      start({
+        t: 'setup',
+        code: $('#suCode').value.trim(),
+        username: $('#suUser').value.trim().toLowerCase(),
+        password: $('#suPass').value,
+        nome: $('#suNome').value.trim(),
+        sigla: $('#suSigla').value.trim(),
+      });
+    });
+    $('#btnRetry').onclick = () => boot(true);
 
     // Pulsante PTT (mouse e touch)
     const b = $('#ptt');
@@ -1613,7 +2129,7 @@
     b.addEventListener('lostpointercapture', release);
     b.addEventListener('contextmenu', (e) => e.preventDefault());
 
-    // Tastiera
+    // Tastiera (solo con la finestra in primo piano: per il gioco c'è il tasto PTT per Windows)
     document.addEventListener('keydown', (e) => {
       if (keyCapture) {
         e.preventDefault();
@@ -1624,6 +2140,11 @@
       }
       if (modal.isOpen()) {
         if (e.key === 'Escape') modal.close();
+        return;
+      }
+      if (!$('#sosOverlay').hidden && e.key === 'Escape') return sos.close();
+      if (RadioApp.admin && RadioApp.admin.isOpen()) {
+        if (e.key === 'Escape') RadioApp.admin.hide();
         return;
       }
       if (e.key === 'Escape' && isTyping(e.target)) e.target.blur();
@@ -1643,7 +2164,7 @@
       ptt.up();
     });
     window.addEventListener('blur', () => {
-      if (state.pttSource) {
+      if (state.pttSource === 'key') {
         state.pttSource = null;
         ptt.up();
       }
@@ -1656,6 +2177,12 @@
     };
     $('#scrim').onclick = () => ui.closeDrawer();
     $('#btnSettings').onclick = openSettings;
+    const openAdmin = () => {
+      ui.closeDrawer();
+      if (RadioApp.admin) RadioApp.admin.show();
+    };
+    $('#btnAdmin').onclick = openAdmin;
+    $('#btnAdminSide').onclick = openAdmin;
     $('#btnSos').onclick = openSos;
     $('#btnSpeaker').onclick = () => {
       settings.muted = !settings.muted;
@@ -1663,7 +2190,7 @@
       audio.resume();
       audio.setVolume();
       ui.speaker();
-      toast(settings.muted ? '🔇 Audio disattivato' : '🔊 Audio attivo');
+      toast(settings.muted ? '🔇 Audio disattivato (gli SOS suonano comunque)' : '🔊 Audio attivo');
     };
     $('#audioBanner').onclick = () => {
       audio.unlock();
@@ -1678,6 +2205,11 @@
       net.send({ t: 'text', text });
       input.value = '';
     });
+
+    // SOS
+    $('#sosAck').onclick = () => sos.ack();
+    $('#sosRepeat').onclick = () => sos.speak();
+    $('#sosClose').onclick = () => sos.close();
 
     // Finestre
     $('#modalForm').addEventListener('submit', (e) => {
@@ -1700,22 +2232,18 @@
     });
     window.addEventListener('online', () => net.reconnectNow());
 
+    if ('speechSynthesis' in window) {
+      pickVoice();
+      speechSynthesis.addEventListener && speechSynthesis.addEventListener('voiceschanged', pickVoice);
+    }
+
     // Installazione come app
-    let installEvt = null;
     window.addEventListener('beforeinstallprompt', (e) => {
       e.preventDefault();
       installEvt = e;
       $('#btnInstall').hidden = false;
     });
-    $('#btnInstall').onclick = async () => {
-      if (!installEvt) return;
-      installEvt.prompt();
-      try {
-        await installEvt.userChoice;
-      } catch (err) {}
-      installEvt = null;
-      $('#btnInstall').hidden = true;
-    };
+    $('#btnInstall').onclick = installApp;
 
     // Orologio / timer del display
     setInterval(() => {
@@ -1724,44 +2252,62 @@
   }
 
   // ================================================================ avvio
-  async function boot() {
-    bindEvents();
+  async function boot(again) {
+    if (!again) bindEvents();
+    showView('loading');
+    loginFail('');
     let info = null;
     try {
       const r = await fetch('/api/info', { cache: 'no-store' });
       if (r.ok) info = await r.json();
     } catch (e) {}
-    if (!info) {
-      loginFail('Server non raggiungibile. Apri la radio dal link del server (es. http://localhost:3000).');
-      info = { nome: 'Udine RP ITA', richiedePassword: false, reparti: [{ nome: 'Civile', icona: '👤', colore: '#9ca3af' }] };
-    }
     state.info = info;
-    state.repartiMap = new Map(info.reparti.map((r) => [r.nome, r]));
+    if (!info) {
+      showView('error');
+      return loginFail('Server non raggiungibile. Se è su Render può metterci fino a un minuto a svegliarsi: riprova tra poco.');
+    }
     $('#serverName').textContent = info.nome;
     $('#sideServer').textContent = info.nome;
-
-    const sel = $('#inReparto');
-    for (const r of info.reparti) {
-      const o = el('option', null, `${r.icona} ${r.nome}`);
-      o.value = r.nome;
-      sel.append(o);
-    }
-    if (info.richiedePassword) $('#pwdField').hidden = false;
-    $('#inPwd').value = state.serverPwd || '';
-    if (state.profile) {
-      $('#inNome').value = state.profile.nome || '';
-      $('#inSigla').value = state.profile.sigla || '';
-      if (state.repartiMap.has(state.profile.reparto)) sel.value = state.profile.reparto;
-    }
     if (!window.isSecureContext) $('#insecureNote').hidden = false;
+    if (info.errore) {
+      showView('error');
+      return loginFail('⚠️ ' + info.errore);
+    }
+    if (info.caricamento) {
+      showView('loading');
+      setTimeout(() => boot(true), 2000);
+      return;
+    }
+    if (info.setup) showView('setup');
+    else showView(state.token ? 'resume' : 'login');
 
-    if ('serviceWorker' in navigator && window.isSecureContext) {
+    if (!again && 'serviceWorker' in navigator && window.isSecureContext) {
       navigator.serviceWorker.register('sw.js').catch(() => {});
     }
     ui.speaker();
     ui.ptt();
   }
 
+  // API usata dal pannello Founder/Staff (admin.js)
+  const RadioApp = {
+    el,
+    toast,
+    modal,
+    state,
+    roleInfo,
+    displayName,
+    fmtTime,
+    request: (op, data) => net.request(op, data),
+    setToken(t) {
+      state.token = t;
+      store.set('token', t);
+    },
+    onAdminDirty: null,
+    onSession: null,
+    admin: null,
+  };
+  window.RadioApp = RadioApp;
   window.__radio = { state, audio, settings }; // per diagnosi dalla console del browser
-  boot();
+
+  boot(false);
 })();

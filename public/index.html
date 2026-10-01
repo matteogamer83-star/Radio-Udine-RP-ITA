@@ -19,27 +19,54 @@
 
   <!-- ===================== ACCESSO ===================== -->
   <section id="login" class="login">
-    <form id="loginForm" class="login-card" autocomplete="on">
+    <div class="login-card">
       <img src="icons/icon.svg" alt="" class="login-logo" width="84" height="84">
       <h1>Radio Udine RP</h1>
       <p class="login-sub">Push-to-talk della community <b id="serverName">Udine RP ITA</b></p>
 
-      <label class="field"><span>Nome RP</span>
-        <input id="inNome" name="nome" maxlength="24" placeholder="es. Marco Bianchi" required autocomplete="nickname"></label>
-      <label class="field"><span>Sigla / nominativo <em>(facoltativo)</em></span>
-        <input id="inSigla" name="sigla" maxlength="16" placeholder="es. Volante 12, Alfa 1"></label>
-      <label class="field"><span>Reparto</span>
-        <select id="inReparto" name="reparto"></select></label>
-      <label class="field" id="pwdField" hidden><span>Codice di accesso del server</span>
-        <input id="inPwd" type="password" autocomplete="current-password"></label>
+      <p id="loadingBox" class="hint">Collegamento alla radio…</p>
 
-      <button id="btnLogin" class="btn btn-primary btn-big" type="submit">📻 Accendi la radio</button>
+      <!-- accesso con account -->
+      <form id="loginForm" hidden autocomplete="on">
+        <label class="field"><span>Nome utente</span>
+          <input id="inUser" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+        <label class="field"><span>Password</span>
+          <input id="inPass" name="password" type="password" autocomplete="current-password" required></label>
+        <button class="btn btn-primary btn-big btn-go" type="submit">📻 Entra e accendi la radio</button>
+        <p class="hint">Non hai un account? Chiedilo al Founder o allo Staff del server.</p>
+      </form>
+
+      <!-- sessione già salvata -->
+      <form id="resumeForm" hidden>
+        <p class="resume-who">Bentornato, <b id="resumeName"></b></p>
+        <button class="btn btn-primary btn-big btn-go" type="submit">📻 Accendi la radio</button>
+        <button id="btnSwitch" class="link-btn" type="button">Entra con un altro account</button>
+      </form>
+
+      <!-- primo avvio: creazione del Founder -->
+      <form id="setupForm" hidden autocomplete="off">
+        <div class="note good">👑 <b>Prima accensione.</b> Crea l'account del <b>Founder</b>, il capo della radio: potrà creare ruoli, staff e utenti.</div>
+        <label class="field"><span>Codice di installazione</span>
+          <input id="suCode" inputmode="numeric" autocomplete="one-time-code" required></label>
+        <p class="hint left">Lo trovi nella finestra nera del server (sul PC) oppure su Render → <b>Logs</b>.</p>
+        <label class="field"><span>Nome utente (per entrare)</span>
+          <input id="suUser" autocapitalize="none" spellcheck="false" required placeholder="es. matteo"></label>
+        <label class="field"><span>Password <em>(almeno 6 caratteri)</em></span>
+          <input id="suPass" type="password" autocomplete="new-password" required minlength="6"></label>
+        <label class="field"><span>Nome RP</span>
+          <input id="suNome" maxlength="24" required placeholder="es. Marco Bianchi"></label>
+        <label class="field"><span>Sigla <em>(facoltativo)</em></span>
+          <input id="suSigla" maxlength="16" placeholder="es. Centrale 1"></label>
+        <button class="btn btn-primary btn-big btn-go" type="submit">👑 Crea il Founder e accendi</button>
+      </form>
+
       <p id="loginErr" class="login-err" role="alert"></p>
+      <button id="btnRetry" class="btn" type="button" hidden>🔄 Riprova</button>
       <p id="insecureNote" class="note" hidden>
         ⚠️ Questo indirizzo non è sicuro (<b>http://</b>): potrai <b>ascoltare</b> ma non <b>parlare</b>.
-        Per usare il microfono apri il link che inizia con <b>https://</b> (chiedilo allo staff).
+        Per usare il microfono apri il link che inizia con <b>https://</b>.
       </p>
-    </form>
+    </div>
   </section>
 
   <!-- ===================== RADIO ===================== -->
@@ -51,6 +78,7 @@
       </div>
       <div class="side-title">Canali</div>
       <nav id="channelList" class="channel-list"></nav>
+      <button id="btnAdminSide" class="side-admin" type="button" hidden>🛡️ Pannello Founder / Staff</button>
       <div class="side-foot">
         <div id="meBox" class="me"></div>
       </div>
@@ -65,11 +93,13 @@
           <span class="top-txt"><span id="chName" class="top-name">—</span><span id="chMeta" class="top-meta"></span></span>
         </button>
         <span id="netStatus" class="net" data-s="off" title="Stato connessione"><i></i><span>Offline</span></span>
+        <span id="pcKey" class="net pc-key" title="Tasto PTT per PC collegato" hidden>⌨️</span>
         <button id="btnInstall" class="icon-btn" type="button" hidden aria-label="Installa app" title="Installa l'app">📲</button>
+        <button id="btnAdmin" class="icon-btn" type="button" hidden aria-label="Pannello" title="Pannello Founder / Staff">🛡️</button>
         <button id="btnSettings" class="icon-btn" type="button" aria-label="Impostazioni" title="Impostazioni">⚙️</button>
       </header>
 
-      <div id="audioBanner" class="banner" hidden>🔇 Audio in pausa — <b>tocca qui</b> per riattivarlo</div>
+      <div id="audioBanner" class="banner" hidden>🔇 Audio bloccato dal browser — <b>tocca qui</b> per sentire la radio</div>
 
       <div class="stage">
         <section id="lcd" class="lcd" data-mode="idle">
@@ -101,9 +131,34 @@
     </main>
   </div>
 
+  <!-- ===================== ALLERTA SOS ===================== -->
+  <div id="sosOverlay" class="sos-overlay" hidden>
+    <div class="sos-card" role="alertdialog" aria-labelledby="sosWho">
+      <div class="sos-title">🚨 SOS 🚨</div>
+      <div id="sosWho" class="sos-who"></div>
+      <div id="sosRole" class="sos-role"></div>
+      <div class="sos-where-box">
+        <small>📍 POSIZIONE</small>
+        <div id="sosWhere" class="sos-where"></div>
+      </div>
+      <div id="sosChan" class="sos-chan"></div>
+      <div id="sosAcks" class="sos-acks"></div>
+      <div class="sos-actions">
+        <button id="sosAck" class="btn btn-primary btn-big" type="button">✅ Ricevuto, intervengo</button>
+        <div class="sos-row">
+          <button id="sosRepeat" class="btn" type="button">🔊 Ripeti</button>
+          <button id="sosClose" class="btn" type="button">Chiudi</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== PANNELLO FOUNDER / STAFF ===================== -->
+  <div id="adminPanel" class="admin" hidden></div>
+
   <!-- ===================== FINESTRE ===================== -->
   <div id="modal" class="modal" hidden>
-    <form id="modalForm" class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <form id="modalForm" class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle" autocomplete="off">
       <h2 id="modalTitle"></h2>
       <div id="modalBody"></div>
       <div id="modalActions" class="modal-actions"></div>
@@ -112,5 +167,6 @@
   <div id="toast" class="toast" hidden></div>
 
   <script src="app.js"></script>
+  <script src="admin.js"></script>
 </body>
 </html>

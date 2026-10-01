@@ -1,11 +1,12 @@
 /* Service worker: permette di installare la radio come app sul telefono.
    Usa sempre la versione più recente dal server, la cache serve solo se sei offline. */
-const CACHE = 'radio-urp-v1';
+const CACHE = 'radio-urp-v2';
 const SHELL = [
   './',
   'index.html',
   'style.css',
   'app.js',
+  'admin.js',
   'mic-worklet.js',
   'manifest.webmanifest',
   'icons/icon.svg',
@@ -29,6 +30,17 @@ self.addEventListener('activate', (e) => {
       .keys()
       .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
+  );
+});
+
+// Clic sulla notifica di un SOS: riporta in primo piano la radio
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+      for (const c of list) if ('focus' in c) return c.focus();
+      return self.clients.openWindow('./');
+    })
   );
 });
 

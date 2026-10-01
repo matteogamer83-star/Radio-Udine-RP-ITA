@@ -1,0 +1,195 @@
+@echo off
+rem Radio Udine RP - Tasto PTT per Windows: parli in radio tenendo premuto un tasto, anche dentro al gioco.
+rem Contiene il tuo codice personale: NON condividere questo file.
+title Radio Udine RP - Tasto PTT
+if not exist "%APPDATA%\RadioUdineRP" mkdir "%APPDATA%\RadioUdineRP"
+more +9 "%~f0" > "%APPDATA%\RadioUdineRP\tasto-ptt.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%APPDATA%\RadioUdineRP\tasto-ptt.ps1"
+pause
+exit /b
+# ---------------------------------------------------------------------------
+# Radio Udine RP - Tasto PTT (PowerShell, incluso in Windows 10/11)
+# Legge lo stato del tasto scelto a livello di sistema (come Discord) e avvisa
+# la radio aperta nel browser di iniziare/finire la trasmissione.
+# ---------------------------------------------------------------------------
+$ErrorActionPreference = 'Stop'
+$Server = '__SERVER__'
+$Token  = '__TOKEN__'
+$Nome   = '__NOME__'
+
+try { $Host.UI.RawUI.WindowTitle = 'Radio Udine RP - Tasto PTT' } catch {}
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class RadioKeys {
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    public static bool IsDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+}
+"@
+
+function Get-KeyName([int]$vk) {
+    $names = @{
+        4 = 'Tasto centrale del mouse (rotella)'; 5 = 'Tasto laterale del mouse (indietro)'; 6 = 'Tasto laterale del mouse (avanti)'
+        8 = 'Backspace'; 9 = 'Tab'; 13 = 'Invio'; 19 = 'Pausa'; 20 = 'Bloc Maiusc'; 27 = 'Esc'; 32 = 'Spazio'
+        33 = 'Pag su'; 34 = 'Pag giu'; 35 = 'Fine'; 36 = 'Home'; 37 = 'Freccia sinistra'; 38 = 'Freccia su'
+        39 = 'Freccia destra'; 40 = 'Freccia giu'; 45 = 'Ins'; 46 = 'Canc'; 91 = 'Windows'; 93 = 'Menu'
+        144 = 'Bloc Num'; 145 = 'Bloc Scorr'; 160 = 'Maiusc sinistro'; 161 = 'Maiusc destro'
+        162 = 'Ctrl sinistro'; 163 = 'Ctrl destro'; 164 = 'Alt sinistro'; 165 = 'Alt Gr'
+    }
+    if ($names.ContainsKey($vk)) { return $names[$vk] }
+    if (($vk -ge 48 -and $vk -le 57) -or ($vk -ge 65 -and $vk -le 90)) { return 'Tasto ' + [string][char]$vk }
+    if ($vk -ge 96 -and $vk -le 105) { return 'Tastierino ' + ($vk - 96) }
+    if ($vk -ge 112 -and $vk -le 135) { return 'F' + ($vk - 111) }
+    return "Tasto n. $vk"
+}
+
+function Select-Key {
+    Write-Host ''
+    Write-Host '  >> Premi ADESSO il tasto (o il tasto del mouse) che vuoi usare per parlare...' -ForegroundColor Yellow
+    Write-Host '     Consiglio: un tasto laterale del mouse o un tasto che il gioco non usa.' -ForegroundColor DarkGray
+    while ($true) {
+        $any = $false
+        for ($k = 3; $k -lt 255; $k++) { if ([RadioKeys]::IsDown($k)) { $any = $true; break } }
+        if (-not $any) { break }
+        Start-Sleep -Milliseconds 30
+    }
+    while ($true) {
+        for ($k = 3; $k -lt 255; $k++) {
+            if ($k -eq 16 -or $k -eq 17 -or $k -eq 18) { continue }
+            if ([RadioKeys]::IsDown($k)) { return $k }
+        }
+        Start-Sleep -Milliseconds 20
+    }
+}
+
+function Send-Msg($ws, $obj) {
+    $json = ConvertTo-Json $obj -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    $seg = New-Object System.ArraySegment[byte] -ArgumentList @(, $bytes)
+    [void]$ws.SendAsync($seg, [Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+}
+
+function Say($text, $color) {
+    $t = (Get-Date).ToString('HH:mm:ss')
+    if ($color) { Write-Host "  [$t] $text" -ForegroundColor $color } else { Write-Host "  [$t] $text" }
+}
+
+# ------------------------------------------------------------- scelta del tasto
+$dir = Join-Path $env:APPDATA 'RadioUdineRP'
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+$keyFile = Join-Path $dir 'tasto.txt'
+[int]$vk = 0
+if (Test-Path $keyFile) { [void][int]::TryParse(((Get-Content $keyFile -Raw) + '').Trim(), [ref]$vk) }
+
+Write-Host ''
+Write-Host '  ============================================================' -ForegroundColor DarkCyan
+Write-Host '    RADIO UDINE RP  -  TASTO PER PARLARE (anche dentro al gioco)' -ForegroundColor Cyan
+Write-Host "    Account: $Nome"
+Write-Host '  ============================================================' -ForegroundColor DarkCyan
+
+if ($vk -gt 0 -and -not $env:RADIO_PTT_NOPROMPT) {
+    Write-Host ''
+    Write-Host "  Tasto attuale: $(Get-KeyName $vk)" -ForegroundColor Green
+    $r = Read-Host '  Premi INVIO per usarlo, oppure scrivi C e premi INVIO per cambiarlo'
+    if ($r -match '^\s*[cC]') { $vk = 0 }
+}
+if ($vk -le 0) {
+    $vk = Select-Key
+    Set-Content -Path $keyFile -Value $vk
+    Write-Host "  OK! Tasto scelto: $(Get-KeyName $vk)" -ForegroundColor Green
+    Start-Sleep -Milliseconds 600
+}
+
+Write-Host ''
+Write-Host '  Lascia aperta questa finestra (puoi ridurla a icona) e la radio nel browser.' -ForegroundColor Gray
+Write-Host "  Tieni premuto [$(Get-KeyName $vk)] per parlare. Per chiudere: chiudi questa finestra." -ForegroundColor Gray
+Write-Host ''
+
+# ------------------------------------------------------------- collegamento e ciclo principale
+$fatal = $false
+$down = $false
+while (-not $fatal) {
+    $ws = $null
+    try {
+        $ws = New-Object System.Net.WebSockets.ClientWebSocket
+        $ws.Options.KeepAliveInterval = [TimeSpan]::FromSeconds(15)
+        Say 'Collegamento alla radio...' DarkGray
+        [void]$ws.ConnectAsync([Uri]$Server, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+        Send-Msg $ws @{ t = 'remote_auth'; token = $Token }
+        $down = $false
+        $lastPing = Get-Date
+        $buffer = New-Object byte[] 16384
+        $seg = New-Object System.ArraySegment[byte] -ArgumentList @(, $buffer)
+        $sb = New-Object System.Text.StringBuilder
+        $recv = $ws.ReceiveAsync($seg, [Threading.CancellationToken]::None)
+
+        while ($ws.State -eq [Net.WebSockets.WebSocketState]::Open) {
+            # 1) il tasto
+            $isDown = [RadioKeys]::IsDown($vk)
+            if ($isDown -ne $down) {
+                $down = $isDown
+                Send-Msg $ws @{ t = 'remote_ptt'; down = $down }
+            }
+
+            # 2) messaggi dalla radio
+            if ($recv.IsCompleted) {
+                if ($recv.IsFaulted -or $recv.IsCanceled) { throw 'connessione interrotta' }
+                $res = $recv.Result
+                if ($res.MessageType -eq [Net.WebSockets.WebSocketMessageType]::Close) { throw 'la radio ha chiuso la connessione' }
+                [void]$sb.Append([Text.Encoding]::UTF8.GetString($buffer, 0, $res.Count))
+                if ($res.EndOfMessage) {
+                    $m = $null
+                    try { $m = $sb.ToString() | ConvertFrom-Json } catch {}
+                    [void]$sb.Clear()
+                    if ($m) {
+                        switch ($m.t) {
+                            'remote_ok' {
+                                Say "COLLEGATO! Account: $($m.nome)" Green
+                                if ($m.sessioni -gt 0) { Say 'Radio aperta nel browser: pronto. Tieni premuto il tasto per parlare.' Green }
+                                else { Say 'ATTENZIONE: apri la radio nel browser e fai l''accesso (lasciala aperta, anche ridotta a icona).' Yellow }
+                            }
+                            'remote_sessions' {
+                                if ($m.n -gt 0) { Say 'Radio aperta nel browser: pronto.' Green }
+                                else { Say 'La radio nel browser e'' chiusa: riaprila per poter parlare.' Yellow }
+                            }
+                            'remote_state' {
+                                switch ($m.state) {
+                                    'on' {
+                                        if ($m.ascoltatori -gt 0) { Say ">>> IN ONDA su $($m.canale) - ti ascoltano: $($m.ascoltatori)" Red }
+                                        else { Say ">>> IN ONDA su $($m.canale) - nessun altro nel canale" Red }
+                                    }
+                                    'idle' { Say 'Fine trasmissione.' DarkGray }
+                                    'busy' { Say "Canale occupato: sta parlando $($m.da)" Yellow }
+                                    'no_session' { Say 'Nessuna radio aperta nel browser: aprila e fai l''accesso.' Yellow }
+                                }
+                            }
+                            'remote_error' { Say $m.msg Red; $fatal = $true; throw 'codice non valido' }
+                            'kicked' { Say "Disconnesso: $($m.msg)" Yellow }
+                        }
+                    }
+                }
+                $recv = $ws.ReceiveAsync($seg, [Threading.CancellationToken]::None)
+            }
+
+            # 3) segnale di vita ogni 20 secondi
+            if (((Get-Date) - $lastPing).TotalSeconds -ge 20) {
+                Send-Msg $ws @{ t = 'ping' }
+                $lastPing = Get-Date
+            }
+            Start-Sleep -Milliseconds 12
+        }
+    } catch {
+        if (-not $fatal) {
+            $err = $_.Exception
+            while ($err.InnerException) { $err = $err.InnerException }
+            Say "Connessione persa ($($err.Message)). Riprovo tra 3 secondi..." Yellow
+        }
+    } finally {
+        if ($ws) { try { $ws.Dispose() } catch {} }
+    }
+    if (-not $fatal) { Start-Sleep -Seconds 3 }
+}
+Write-Host ''
+Write-Host '  Il tasto PTT si e'' fermato. Scarica di nuovo il file dalla radio (Impostazioni).' -ForegroundColor Red
