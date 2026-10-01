@@ -480,6 +480,34 @@ select.input { appearance: auto; }
 .msg-annuncio.lv-emergenza { background: #3b0d0d; border-color: var(--tx); }
 .msg-annuncio.lv-emergenza .ann-title { color: #ffb3b3; }
 
+/* chiamate e richieste alla Centrale */
+.callbar { flex: none; display: flex; gap: 8px; margin: 2px 0; }
+.call-ptt {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; text-align: left; padding: 8px 12px;
+  border-radius: 14px; border: 1px solid #1e5a80; background: linear-gradient(180deg, #0d1c2a, #0b1520);
+  touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.call-ptt:hover { border-color: #38bdf8; }
+.call-ic { font-size: 22px; flex: none; pointer-events: none; }
+.call-txt { min-width: 0; display: flex; flex-direction: column; pointer-events: none; }
+.call-txt b { font-size: 14px; color: #e0f2fe; }
+.call-txt small { font-size: 12px; color: #7dd3fc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.call-ptt.on { background: linear-gradient(180deg, #7a1010, #4a0a0a); border-color: var(--tx); animation: onair 1.2s ease-in-out infinite; }
+.call-ptt.on .call-txt b, .call-ptt.on .call-txt small { color: #fff; }
+.call-req { flex: none; border-radius: 14px; border: 1px solid #6b4a0e; background: #2a1d05; color: #ffd98a; font-weight: 700; padding: 0 14px; }
+.call-req:hover { filter: brightness(1.2); }
+.disp-reply { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px 6px 6px 10px; border-radius: 10px; background: #1a1430; border: 1px solid #5b3f9a; font-size: 13px; color: #ddd6fe; }
+.disp-reply span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.disp-reply.on { background: #3b1f6e; border-color: #a78bfa; color: #fff; font-weight: 700; }
+.disp-btn.answer, .btn.answer { background: #4c1d95; border-color: #a78bfa; color: #fff; }
+.lcd[data-mode=call] { --c: #ddd6fe; background: linear-gradient(180deg, #1f1238, #130b24); border-color: #6d4bb8; box-shadow: inset 0 0 30px #0009, 0 0 24px #a78bfa33; }
+.msg-head .tag.call { background: #24164a; border-color: #6d4bb8; color: #ddd6fe; }
+.msg-richiesta { background: #1a1430; border-color: #5b3f9a; }
+.msg-richiesta .ann-title { color: #c4b5fd; }
+.msg-richiesta .text { font-weight: 600; }
+.msg-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.quick-row { display: flex; flex-wrap: wrap; gap: 6px; }
+
 /* finestra "Comunicato" */
 textarea.input { resize: vertical; min-height: 74px; font: inherit; line-height: 1.4; }
 .seg-lv { width: 100%; }

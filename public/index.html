@@ -121,6 +121,15 @@
         <!-- Centrale operativa: parla a più canali insieme e manda comunicati (solo con il permesso) -->
         <section id="dispBar" class="disp" hidden></section>
 
+        <!-- Da qualsiasi canale: parla direttamente con la Centrale o mandale una richiesta -->
+        <section id="callBar" class="callbar" hidden>
+          <button id="btnCall" class="call-ptt" type="button">
+            <span class="call-ic">📞</span>
+            <span class="call-txt"><b id="callTitle">Parla con la Centrale</b><small id="callSub">tieni premuto</small></span>
+          </button>
+          <button id="btnRequest" class="call-req" type="button">✍️ Richiesta</button>
+        </section>
+
         <section class="controls">
           <button id="btnSos" class="side-btn sos" type="button" title="Allerta SOS"><span>🚨</span><small>SOS</small></button>
           <button id="ptt" class="ptt" type="button" data-state="idle">

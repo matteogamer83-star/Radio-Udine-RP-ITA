@@ -42,6 +42,8 @@ const LIVELLI = ['info', 'allerta', 'emergenza'];
 const FOUNDER_ROLE = { id: 'founder', nome: 'Founder', icona: '👑', colore: '#f2c230' };
 const ECO_ROLE = { id: 'eco', nome: 'Prova audio', icona: '🔁', colore: '#22d3ee' };
 const ECO_USER = { id: 0, uid: 'eco', nome: 'Eco · la tua voce', sigla: '', ruolo: 'eco' };
+// Chi parla "come Centrale" (comunicati, più canali) compare con il nome della Centrale, non con il suo
+const CENTRALE_ROLE_PUB = { id: 'centrale', nome: 'Centrale', icona: '📡', colore: '#38bdf8' };
 
 // ================================================================== config iniziale
 
@@ -226,7 +228,7 @@ function canAssignRole(actor, roleId) {
   return actor.founder || !isAdminRole(r);
 }
 const displayName = (u) => (u.sigla ? `${u.sigla} · ${u.nome}` : u.nome);
-const publicRoles = () => [FOUNDER_ROLE, ECO_ROLE, ...db.roles.map((r) => ({ id: r.id, nome: r.nome, icona: r.icona, colore: r.colore }))];
+const publicRoles = () => [FOUNDER_ROLE, ECO_ROLE, CENTRALE_ROLE_PUB, ...db.roles.map((r) => ({ id: r.id, nome: r.nome, icona: r.icona, colore: r.colore }))];
 
 // ================================================================== sessioni (token firmati)
 
@@ -343,8 +345,20 @@ const publicUser = (c) => ({ id: c.id, uid: c.user.id, nome: c.user.nome, sigla:
 const webOf = (user) => [...conns].filter((c) => c.kind === 'web' && c.user && c.user.id === user.id);
 const remotesOf = (user) => [...conns].filter((c) => c.kind === 'remote' && c.user && c.user.id === user.id);
 
+// la finestra nera del tasto PC non sempre mostra accenti e simboli: solo lettere semplici
+const plain = (s) =>
+  String(s || '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/·/g, '-')
+    .replace(/[^\x20-\x7E]/g, '')
+    .trim();
+
 function notifyRemote(user, obj) {
-  for (const r of remotesOf(user)) send(r, { t: 'remote_state', ...obj });
+  const o = { t: 'remote_state', ...obj };
+  if (o.canale) o.canale = plain(o.canale);
+  if (o.da) o.da = plain(o.da);
+  for (const r of remotesOf(user)) send(r, o);
 }
 function notifyRemoteSessions(user) {
   const n = webOf(user).filter((c) => c.remoteOk).length;
@@ -370,12 +384,31 @@ function channelInfo(user, ch) {
 }
 const channelList = (user) => [...channels.values()].filter((ch) => canSee(user, ch.cfg)).map((ch) => channelInfo(user, ch));
 
+// ------------------------------------------------------------------ la Centrale
+// = i canali con "riceve gli SOS" + chi ha il permesso Centrale e ha acceso "Più canali" (in servizio)
+const centraleChannels = () => [...channels.values()].filter((c) => c.cfg.riceveSos && !c.cfg.eco);
+const activeDispatchers = () => [...conns].filter((c) => c.kind === 'web' && c.user && c.dispOn && permsOf(c.user).diramazione);
+function centraleStatus() {
+  const list = centraleChannels();
+  if (!list.length) return null;
+  const people = new Set();
+  for (const ch of list) for (const c of ch.clients) if (c.user) people.add(c.user.id);
+  for (const c of activeDispatchers()) people.add(c.user.id);
+  return { ...chMini(list[0]), persone: people.size };
+}
+/** Come appare chi parla a nome della Centrale (l'id resta quello della connessione) */
+function centraleUser(conn) {
+  const list = centraleChannels();
+  return { id: conn.id, uid: 'centrale', nome: list.length ? list[0].cfg.nome : 'Centrale Operativa', sigla: '', ruolo: 'centrale' };
+}
+
 let channelsTimer = null;
 function scheduleChannelsUpdate() {
   if (channelsTimer) return;
   channelsTimer = setTimeout(() => {
     channelsTimer = null;
-    for (const c of conns) if (c.kind === 'web' && c.user) send(c, { t: 'channels', channels: channelList(c.user) });
+    const centrale = centraleStatus();
+    for (const c of conns) if (c.kind === 'web' && c.user) send(c, { t: 'channels', channels: channelList(c.user), centrale });
   }, 150);
 }
 
@@ -391,6 +424,7 @@ function sessionPayload(conn) {
     roles: publicRoles(),
     channels: channelList(conn.user),
     channel: ch ? channelInfo(conn.user, ch) : null,
+    centrale: centraleStatus(),
     server: settings().nomeServer,
     maxTalk: maxTalkMs() / 1000,
     pcKeys: remotesOf(conn.user).length,
@@ -434,7 +468,7 @@ function refreshAll() {
       leaveChannel(c);
       send(c, { t: 'channel_gone', msg: 'Non hai più accesso a questo canale.' });
     }
-    if (c.monitor && c.monitor.size) setMonitor(c, [...c.monitor]); // permessi cambiati: ricontrolla l'ascolto
+    if ((c.monitor && c.monitor.size) || c.dispOn) setMonitor(c, [...(c.monitor || [])], c.dispOn); // permessi cambiati: ricontrolla
     send(c, { t: 'session', ...sessionPayload(c) });
   }
   for (const ch of channels.values()) broadcast(ch, { t: 'users', users: [...ch.clients].map(publicUser) });
@@ -452,12 +486,13 @@ function afterChange() {
   refreshAdmins();
 }
 
-/// ================================================================== canali e trasmissione
+// ================================================================== canali e trasmissione
 //
-// Una trasmissione ("talk") può andare su UN canale (normale) oppure su PIÙ canali insieme
-// (diramazione della Centrale, con priorità). La sentono:
+// Una trasmissione ("talk") può andare su UN canale (normale), su PIÙ canali insieme
+// (la Centrale, con priorità) oppure alla Centrale da qualsiasi canale (chiamata). La sentono:
 //   - chi è dentro ai suoi canali
 //   - chi ha il permesso Centrale e "ascolta" quei canali da fuori (monitor)
+//   - per le chiamate: anche chi è in servizio come Centrale ("Più canali" acceso), ovunque sia
 // L'audio verso le radio aggiornate ha 2 byte davanti con il numero della trasmissione,
 // così la Centrale può sentire più canali che parlano nello stesso momento.
 
@@ -477,6 +512,12 @@ function audienceOf(list) {
   const out = new Map();
   for (const ch of list) for (const c of ch.clients) out.set(c, null);
   for (const ch of list) for (const c of ch.monitors) if (!out.has(c)) out.set(c, ch);
+  return out;
+}
+/** Chi sente una trasmissione (ricalcolato ogni volta: chi entra a metà la sente subito) */
+function talkAudience(talk) {
+  const out = audienceOf(talk.channels);
+  if (talk.chiamata) for (const c of activeDispatchers()) if (!out.has(c)) out.set(c, talk.channels[0] || null);
   return out;
 }
 /** Persone diverse (non dispositivi) in un elenco di connessioni */
@@ -506,6 +547,7 @@ function talkStartMsg(talk, via) {
     canali: talk.channels.length,
     prio: talk.prio,
     origine: chMini(talk.origin),
+    chiamata: talk.chiamata || null,
   };
 }
 
@@ -537,6 +579,10 @@ function endTalk(talk, reason) {
       meta = { tipo: 'voce', id: talk.id, from: talk.from, ts: talk.ts, durata: Math.round(seconds * 10) / 10 };
       if (talk.channels.length > 1) meta.canali = talk.channels.length;
       if (talk.prio) meta.prio = true;
+      if (talk.chiamata) {
+        meta.chiamata = talk.chiamata; // canale di chi ha chiamato
+        meta.centrale = talk.channels[0] ? chMini(talk.channels[0]) : null; // dove resta registrata
+      }
       if (pcm && maxVoice() > 0) {
         for (const ch of talk.channels) {
           ch.voice.push({ meta, pcm });
@@ -547,11 +593,14 @@ function endTalk(talk, reason) {
           }
         }
       }
-      const where = talk.channels.length > 1 ? `#${talk.origin.id} + ${talk.channels.length - 1} canali (Centrale)` : `#${talk.origin.id}`;
-      log(`${where}  ${talk.from.nome} ha parlato ${meta.durata}s${reason === 'cut' ? ' (interrotto dalla Centrale)' : ''}`);
+      const chi = displayName(talk.conn.user || { nome: talk.from.nome });
+      let where = `#${talk.origin.id}`;
+      if (talk.chiamata) where = `📞 #${talk.origin.id} → Centrale`;
+      else if (talk.prio) where = `📡 Centrale su ${talk.channels.length} ${talk.channels.length === 1 ? 'canale' : 'canali'}`;
+      log(`${where}  ${chi} ha parlato ${meta.durata}s${reason === 'cut' ? ' (interrotto dalla Centrale)' : ''}`);
     }
   }
-  const aud = audienceOf(talk.channels);
+  const aud = talkAudience(talk);
   if (reason === 'left') aud.delete(talk.conn);
   else aud.set(talk.conn, null); // chi parlava vede il suo vocale in cronologia
   for (const [c, via] of aud) {
@@ -563,38 +612,17 @@ function endTalk(talk, reason) {
 
 /** La Centrale prende la linea: chi stava parlando viene interrotto */
 function cutTalk(talk, by) {
-  send(talk.conn, { t: 'ptt_cut', by: publicUser(by) });
+  send(talk.conn, { t: 'ptt_cut', by: centraleUser(by) });
   endTalk(talk, 'cut');
 }
 
-function startTalk(conn, msg) {
-  const user = conn.user;
-  const ch = conn.channel && channels.get(conn.channel);
-  if (!ch) return;
-  if (conn.talk) {
-    const t = conn.talk;
-    return send(conn, { t: 'ptt_ok', maxTalk: maxTalkMs() / 1000, canali: t.channels.length, prio: t.prio, saltati: [] });
-  }
-  stopEcho(conn);
-  const prio = !!msg.diramazione && !ch.cfg.eco && permsOf(user).diramazione;
-  const wanted = pickTargets(conn, ch, msg);
+function sendBusy(conn, talk, centrale) {
+  notifyRemote(conn.user, { state: 'busy', da: talk.from.nome });
+  send(conn, { t: 'ptt_busy', by: talk.from, prio: talk.prio, centrale: !!centrale });
+}
 
-  const own = ch.talk;
-  if (own && (!prio || own.prio)) {
-    notifyRemote(user, { state: 'busy', da: own.from.nome });
-    return send(conn, { t: 'ptt_busy', by: own.from, prio: own.prio });
-  }
-  const list = [];
-  const saltati = [];
-  for (const c of wanted) {
-    if (c.talk && c.talk.prio) {
-      saltati.push(c.cfg.nome); // un'altra Centrale sta già parlando lì
-      continue;
-    }
-    if (c.talk) cutTalk(c.talk, conn);
-    list.push(c);
-  }
-
+/** Crea la trasmissione, occupa i canali e avvisa chi ascolta */
+function openTalk(conn, list, origin, extra) {
   const talk = {
     id: rid(),
     n: nextStream(),
@@ -603,12 +631,14 @@ function startTalk(conn, msg) {
     ts: Date.now(),
     chunks: [],
     bytes: 0,
-    keep: ch.cfg.eco || maxVoice() > 0,
+    keep: origin.cfg.eco || maxVoice() > 0,
     channels: list,
-    origin: ch,
-    prio,
+    origin,
+    prio: false,
+    chiamata: null,
     timer: null,
     ended: false,
+    ...extra,
   };
   for (const c of list) {
     c.talk = talk;
@@ -620,21 +650,73 @@ function startTalk(conn, msg) {
     send(conn, { t: 'ptt_timeout' });
     endTalk(talk, 'timeout');
   }, maxTalkMs());
-
-  const aud = audienceOf(list);
+  const aud = talkAudience(talk);
   aud.delete(conn);
-  const ascoltatori = countPeople(aud.keys(), user.id);
+  const ascoltatori = countPeople(aud.keys(), conn.user.id);
+  return { talk, aud, ascoltatori };
+}
+
+function startTalk(conn, msg) {
+  const user = conn.user;
+  const ch = conn.channel && channels.get(conn.channel);
+  if (!ch) return;
+  if (conn.talk) {
+    const t = conn.talk;
+    return send(conn, { t: 'ptt_ok', maxTalk: maxTalkMs() / 1000, canali: t.channels.length, prio: t.prio, chiamata: !!t.chiamata, saltati: [] });
+  }
+  stopEcho(conn);
+  // chiamata alla Centrale da un altro canale (se sei già in Centrale parli normalmente)
+  if (msg.centrale && !ch.cfg.riceveSos && !ch.cfg.eco) return startCall(conn, ch);
+
+  const prio = !!msg.diramazione && !ch.cfg.eco && permsOf(user).diramazione;
+  const wanted = pickTargets(conn, ch, msg);
+  const own = ch.talk;
+  if (own && (!prio || own.prio)) return sendBusy(conn, own);
+  const list = [];
+  const saltati = [];
+  for (const c of wanted) {
+    if (c.talk && c.talk.prio) {
+      saltati.push(c.cfg.nome); // un'altra Centrale sta già parlando lì
+      continue;
+    }
+    if (c.talk) cutTalk(c.talk, conn);
+    list.push(c);
+  }
+
+  // chi parla come Centrale compare con il nome della Centrale, non con il suo
+  const { talk, aud, ascoltatori } = openTalk(conn, list, ch, prio ? { prio: true, from: centraleUser(conn) } : {});
   send(conn, { t: 'ptt_ok', maxTalk: maxTalkMs() / 1000, canali: list.length, ascoltatori, saltati, prio });
   for (const [c, via] of aud) send(c, talkStartMsg(talk, via));
   notifyRemote(user, { state: 'on', canale: list.length > 1 ? `${list.length} canali (Centrale)` : ch.cfg.nome, ascoltatori });
-  if (list.length > 1) log(`📡 ${displayName(user)} parla su ${list.length} canali: ${list.map((c) => c.cfg.nome).join(', ')}`);
+  if (list.length > 1) log(`📡 ${displayName(user)} parla come Centrale su ${list.length} canali: ${list.map((c) => c.cfg.nome).join(', ')}`);
   scheduleChannelsUpdate();
 }
 
-/** La Centrale ascolta anche questi canali (oltre a quello in cui si trova) */
-function setMonitor(conn, ids) {
+/** Chiamata alla Centrale: da qualsiasi canale, senza lasciarlo */
+function startCall(conn, ch) {
+  const list = centraleChannels();
+  if (!list.length && !activeDispatchers().some((c) => c.user.id !== conn.user.id)) {
+    return send(conn, { t: 'ptt_fail', msg: "Non c'è una Centrale: chiedi al Founder di segnare un canale come «Centrale (riceve gli SOS)»." });
+  }
+  const busy = list.find((c) => c.talk);
+  if (busy) return sendBusy(conn, busy.talk, true);
+  const { talk, aud, ascoltatori } = openTalk(conn, list, ch, { chiamata: chMini(ch) });
+  send(conn, { t: 'ptt_ok', maxTalk: maxTalkMs() / 1000, canali: list.length, ascoltatori, saltati: [], chiamata: true });
+  for (const [c, via] of aud) send(c, talkStartMsg(talk, via));
+  notifyRemote(conn.user, { state: 'on', canale: 'Centrale (chiamata)', ascoltatori });
+  scheduleChannelsUpdate();
+}
+
+/** La Centrale ascolta anche questi canali (oltre a quello in cui si trova). attivo = "Più canali" acceso */
+function setMonitor(conn, ids, attivo) {
+  const ok = conn.kind === 'web' && conn.user && permsOf(conn.user).diramazione;
+  const on = !!(ok && attivo);
+  if (on !== !!conn.dispOn) {
+    conn.dispOn = on; // in servizio come Centrale: riceve le chiamate e le richieste
+    scheduleChannelsUpdate();
+  }
   const want = new Set();
-  if (conn.kind === 'web' && conn.user && permsOf(conn.user).diramazione && Array.isArray(ids)) {
+  if (ok && Array.isArray(ids)) {
     for (const id of ids.slice(0, 100)) {
       const ch = channels.get(String(id));
       if (ch && canTarget(conn.user, ch.cfg)) want.add(ch.id);
@@ -686,7 +768,7 @@ function onAudio(conn, data) {
   if (talk.keep) talk.chunks.push(data);
   talk.bytes += data.length;
   const framed = frame(talk.n, data);
-  for (const c of audienceOf(talk.channels).keys()) {
+  for (const c of talkAudience(talk).keys()) {
     if (c === conn || c.ws.readyState !== WebSocket.OPEN) continue;
     if (c.ws.bufferedAmount > MAX_SEND_BUFFER) continue; // rete lenta: salta il pacchetto
     c.ws.send(c.hdr ? framed : data, { binary: true }); // le radio non aggiornate ricevono l'audio senza numero
@@ -703,6 +785,12 @@ function channelFeed(ch) {
 function pushText(ch, m) {
   ch.texts.push(m);
   if (ch.texts.length > MAX_TEXT_HISTORY) ch.texts.shift();
+}
+// chi ha mandato davvero un comunicato (a tutti compare solo "Centrale")
+const authors = new Map();
+function remember(id, uid) {
+  authors.set(id, uid);
+  if (authors.size > 2000) authors.delete(authors.keys().next().value);
 }
 function findText(tipo, id) {
   for (const c of channels.values()) {
@@ -819,7 +907,7 @@ function doRemoteAuth(conn, msg) {
   conn.kind = 'remote';
   conn.user = user;
   conn.tv = user.tv;
-  send(conn, { t: 'remote_ok', nome: displayName(user), sessioni: webOf(user).filter((c) => c.remoteOk).length });
+  send(conn, { t: 'remote_ok', nome: plain(displayName(user)), sessioni: webOf(user).filter((c) => c.remoteOk).length });
   notifyPcKey(user, true);
   log(`⌨️  Tasto PTT collegato per ${displayName(user)}`);
 }
@@ -1084,7 +1172,7 @@ function handleWeb(conn, msg) {
       break;
 
     case 'monitor':
-      setMonitor(conn, msg.canali);
+      setMonitor(conn, msg.canali, msg.attivo);
       break;
 
     case 'text': {
@@ -1094,17 +1182,21 @@ function handleWeb(conn, msg) {
       const testo = clean(msg.text, 300);
       if (!testo) return;
       conn.lastText = now;
-      const list = pickTargets(conn, ch, msg); // la Centrale può scrivere a più canali insieme
-      const m = { tipo: 'testo', id: rid(), from: publicUser(conn), ts: now, testo };
+      // la Centrale ("Più canali" acceso) scrive a più canali insieme, con il nome della Centrale
+      const asCentrale = !!msg.diramazione && !ch.cfg.eco && permsOf(user).diramazione;
+      const list = pickTargets(conn, ch, msg);
+      const m = { tipo: 'testo', id: rid(), from: asCentrale ? centraleUser(conn) : publicUser(conn), ts: now, testo };
       if (list.length > 1) m.canali = list.length;
+      if (asCentrale) log(`📡 Messaggio della Centrale (${displayName(user)}) a ${list.length} canali: ${testo}`);
       for (const c of list) pushText(c, m);
       const aud = audienceOf(list);
       aud.set(conn, null);
-      for (const [c, via] of aud) send(c, { t: 'text', msg: m, via: via ? chMini(via) : null });
+      for (const [c, via] of aud) send(c, { t: 'text', msg: m, via: via ? chMini(via) : null, mio: c === conn });
       break;
     }
 
-    // Comunicato della Centrale: notizia, allerta o emergenza ai canali scelti
+    // Comunicato della Centrale: notizia, allerta o emergenza ai canali scelti.
+    // Compare come "Centrale", non con il nome di chi lo manda (resta solo nei log del server).
     case 'annuncio': {
       if (!permsOf(user).diramazione) return send(conn, { t: 'error', code: 'perm', msg: 'Non hai il permesso di mandare comunicati.' });
       const now = Date.now();
@@ -1125,7 +1217,7 @@ function handleWeb(conn, msg) {
       const m = {
         tipo: 'annuncio',
         id: rid(),
-        from: publicUser(conn),
+        from: centraleUser(conn),
         ts: now,
         livello: LIVELLI.includes(msg.livello) ? msg.livello : 'info',
         testo,
@@ -1134,6 +1226,7 @@ function handleWeb(conn, msg) {
         canali: list.map(chMini),
         presoDa: [],
       };
+      remember(m.id, user.id);
       for (const c of list) pushText(c, m);
       const aud = new Set();
       for (const c of list) for (const x of c.clients) if (x.user && x.user.id !== user.id) aud.add(x);
@@ -1146,18 +1239,60 @@ function handleWeb(conn, msg) {
 
     case 'annuncio_ack': {
       const m = findText('annuncio', msg.id);
-      if (!m || m.from.uid === user.id || !m.canali.some((c) => c.id === conn.channel)) return;
+      const autore = m && authors.get(m.id);
+      if (!m || autore === user.id || !m.canali.some((c) => c.id === conn.channel)) return;
       if (m.presoDa.some((x) => x.uid === user.id) || m.presoDa.length >= 200) return;
       const by = publicUser(conn);
       m.presoDa.push({ uid: user.id, nome: displayName(user) });
-      const aud = new Set();
+      const aud = new Map(); // connessione -> è di chi l'ha mandato?
       for (const x of m.canali) {
         const c = channels.get(x.id);
-        if (c) for (const y of c.clients) aud.add(y);
+        if (c) for (const y of c.clients) aud.set(y, false);
       }
-      for (const c of conns) if (c.kind === 'web' && c.user && c.user.id === m.from.uid) aud.add(c);
-      const data = JSON.stringify({ t: 'annuncio_ack', id: m.id, by, annuncio: { from: m.from, livello: m.livello, testo: m.testo } });
-      for (const c of aud) if (c.ws.readyState === WebSocket.OPEN) c.ws.send(data);
+      for (const c of conns) if (c.kind === 'web' && c.user && c.user.id === autore) aud.set(c, true);
+      const info = { from: m.from, livello: m.livello, testo: m.testo };
+      for (const [c, mio] of aud) send(c, { t: 'annuncio_ack', id: m.id, by, annuncio: info, mio });
+      break;
+    }
+
+    // Richiesta scritta alla Centrale (ambulanza, rinforzi, carro attrezzi...) da qualsiasi canale
+    case 'richiesta': {
+      if (!ch) return;
+      const now = Date.now();
+      if (now - (conn.lastReq || 0) < 4000) return send(conn, { t: 'error', code: 'rate', msg: 'Aspetta qualche secondo prima di mandare un\'altra richiesta.' });
+      const testo = clean(msg.text, 200);
+      if (!testo) return send(conn, { t: 'error', code: 'dati', msg: 'Scrivi cosa ti serve.' });
+      const list = centraleChannels();
+      const aud = audienceOf(list);
+      for (const c of activeDispatchers()) if (!aud.has(c)) aud.set(c, list[0] || null);
+      if (!list.length && ![...aud.keys()].some((c) => c.user && c.user.id !== user.id)) {
+        return send(conn, { t: 'error', code: 'no_centrale', msg: "Non c'è una Centrale: chiedi al Founder di segnare un canale come «Centrale (riceve gli SOS)»." });
+      }
+      conn.lastReq = now;
+      const m = { tipo: 'richiesta', id: rid(), from: publicUser(conn), ts: now, testo, luogo: clean(msg.luogo, 80), canale: chMini(ch), presoDa: [] };
+      for (const c of list) pushText(c, m);
+      const persone = countPeople(aud.keys(), user.id);
+      for (const [c, via] of aud) if (c.user && c.user.id !== user.id) send(c, { t: 'richiesta', msg: m, via: via ? chMini(via) : null });
+      for (const w of webOf(user)) send(w, { t: 'richiesta', msg: m, mio: true, persone });
+      log(`📞 Richiesta alla Centrale da ${displayName(user)} (#${ch.id}): ${testo}${m.luogo ? ' — ' + m.luogo : ''}`);
+      break;
+    }
+
+    case 'richiesta_ack': {
+      const m = findText('richiesta', msg.id);
+      const inCentrale = ch && ch.cfg.riceveSos;
+      if (!m || m.from.uid === user.id || !(inCentrale || permsOf(user).diramazione)) return;
+      if (m.presoDa.some((x) => x.uid === user.id) || m.presoDa.length >= 50) return;
+      m.presoDa.push({ uid: user.id, nome: displayName(user) });
+      const list = centraleChannels();
+      const aud = audienceOf(list);
+      for (const c of activeDispatchers()) aud.set(c, null);
+      const by = publicUser(conn);
+      for (const c of aud.keys()) send(c, { t: 'richiesta_ack', id: m.id, by });
+      // chi ha chiesto vede solo "la Centrale", non il nome dell'operatore
+      for (const c of conns) {
+        if (c.kind === 'web' && c.user && c.user.id === m.from.uid) send(c, { t: 'richiesta_ack', id: m.id, by: centraleUser(conn), mio: true });
+      }
       break;
     }
 
@@ -1176,7 +1311,7 @@ function handleWeb(conn, msg) {
         testo: clean(msg.text, 120),
         canale: { id: ch.id, nome: ch.cfg.nome, icona: ch.cfg.icona },
       };
-      const targets = new Set([...ch.clients, ...ch.monitors]);
+      const targets = new Set([...ch.clients, ...ch.monitors, ...activeDispatchers()]);
       pushText(ch, m);
       for (const other of channels.values()) {
         if (other === ch || !other.cfg.riceveSos) continue;
@@ -1201,6 +1336,7 @@ function handleWeb(conn, msg) {
         if (c.id === m.canale.id || c.cfg.riceveSos) for (const x of c.clients) targets.add(x);
         if (c.id === m.canale.id) for (const x of c.monitors) targets.add(x);
       }
+      for (const x of activeDispatchers()) targets.add(x);
       const data = JSON.stringify({ t: 'sos_ack', id: m.id, by, alert: { from: m.from, testo: m.testo } });
       for (const c of targets) if (c.ws.readyState === WebSocket.OPEN) c.ws.send(data);
       break;
@@ -1234,13 +1370,15 @@ function handleRemote(conn, msg) {
   switch (msg.t) {
     case 'remote_ptt': {
       const down = !!msg.down;
-      conn.remoteDown = down;
+      const centrale = !!msg.centrale; // secondo tasto: chiama la Centrale
+      if (centrale) conn.remoteDown2 = down;
+      else conn.remoteDown = down;
       const targets = webOf(conn.user).filter((c) => c.remoteOk);
       if (!targets.length) {
         if (down) send(conn, { t: 'remote_state', state: 'no_session' });
         return;
       }
-      for (const t of targets) send(t, { t: 'remote_ptt', down });
+      for (const t of targets) send(t, { t: 'remote_ptt', down, centrale });
       break;
     }
     case 'ping':
@@ -1359,9 +1497,12 @@ const server = http.createServer((req, res) => {
   if (m) {
     const conn = byKey.get(url.searchParams.get('k') || '');
     const ch = channels.get(decodeURIComponent(m[1]));
-    const ascolta = conn && ch && (conn.channel === ch.id || (conn.monitor && conn.monitor.has(ch.id)));
-    if (!ascolta) return sendJson(res, 403, { errore: 'Non autorizzato' });
-    const item = ch.voice.find((v) => v.meta.id === m[2]);
+    // può riascoltare: chi è nel canale, la Centrale (che lo ascolta o può raggiungerlo), chi l'ha registrato
+    const ascolta =
+      conn && conn.user && ch && (conn.channel === ch.id || (conn.monitor && conn.monitor.has(ch.id)) || (permsOf(conn.user).diramazione && canTarget(conn.user, ch.cfg)));
+    const item = ch && ch.voice.find((v) => v.meta.id === m[2]);
+    const autore = conn && conn.user && item && item.meta.chiamata && item.meta.from.uid === conn.user.id;
+    if (!ascolta && !autore) return sendJson(res, 403, { errore: 'Non autorizzato' });
     if (!item) return sendJson(res, 404, { errore: 'Messaggio non più disponibile' });
     const wav = wavFromPcm(item.pcm);
     res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'no-store' });
@@ -1417,7 +1558,10 @@ wss.on('connection', (ws, req) => {
       notifyRemoteSessions(user);
     } else if (conn.kind === 'remote') {
       // il tasto si è scollegato mentre era premuto: chiudi la trasmissione
-      if (conn.remoteDown) for (const t of webOf(user).filter((c) => c.remoteOk)) send(t, { t: 'remote_ptt', down: false });
+      for (const t of webOf(user).filter((c) => c.remoteOk)) {
+        if (conn.remoteDown) send(t, { t: 'remote_ptt', down: false });
+        if (conn.remoteDown2) send(t, { t: 'remote_ptt', down: false, centrale: true });
+      }
       notifyPcKey(user, false);
     }
   });

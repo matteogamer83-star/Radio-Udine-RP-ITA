@@ -45,9 +45,9 @@ function Get-KeyName([int]$vk) {
     return "Tasto n. $vk"
 }
 
-function Select-Key {
+function Select-Key([string]$cosa) {
     Write-Host ''
-    Write-Host '  >> Premi ADESSO il tasto (o il tasto del mouse) che vuoi usare per parlare...' -ForegroundColor Yellow
+    Write-Host "  >> Premi ADESSO il tasto (o il tasto del mouse) che vuoi usare per $cosa..." -ForegroundColor Yellow
     Write-Host '     Consiglio: un tasto laterale del mouse o un tasto che il gioco non usa.' -ForegroundColor DarkGray
     while ($true) {
         $any = $false
@@ -82,6 +82,10 @@ if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null 
 $keyFile = Join-Path $dir 'tasto.txt'
 [int]$vk = 0
 if (Test-Path $keyFile) { [void][int]::TryParse(((Get-Content $keyFile -Raw) + '').Trim(), [ref]$vk) }
+# secondo tasto (facoltativo): parla direttamente con la Centrale. -1 = mai chiesto, 0 = nessuno
+$keyFile2 = Join-Path $dir 'tasto-centrale.txt'
+[int]$vk2 = -1
+if (Test-Path $keyFile2) { [void][int]::TryParse(((Get-Content $keyFile2 -Raw) + '').Trim(), [ref]$vk2) }
 
 Write-Host ''
 Write-Host '  ============================================================' -ForegroundColor DarkCyan
@@ -91,20 +95,38 @@ Write-Host '  ============================================================' -For
 
 if ($vk -gt 0 -and -not $env:RADIO_PTT_NOPROMPT) {
     Write-Host ''
-    Write-Host "  Tasto attuale: $(Get-KeyName $vk)" -ForegroundColor Green
-    $r = Read-Host '  Premi INVIO per usarlo, oppure scrivi C e premi INVIO per cambiarlo'
-    if ($r -match '^\s*[cC]') { $vk = 0 }
+    Write-Host "  Tasto per parlare: $(Get-KeyName $vk)" -ForegroundColor Green
+    if ($vk2 -gt 0) { Write-Host "  Tasto per la Centrale: $(Get-KeyName $vk2)" -ForegroundColor Green }
+    $r = Read-Host '  Premi INVIO per usarli, oppure scrivi C e premi INVIO per cambiarli'
+    if ($r -match '^\s*[cC]') { $vk = 0; $vk2 = -1 }
 }
 if ($vk -le 0) {
-    $vk = Select-Key
+    $vk = Select-Key 'parlare'
     Set-Content -Path $keyFile -Value $vk
     Write-Host "  OK! Tasto scelto: $(Get-KeyName $vk)" -ForegroundColor Green
     Start-Sleep -Milliseconds 600
 }
+if ($vk2 -lt 0) {
+    if ($env:RADIO_PTT_NOPROMPT) { $vk2 = 0 }
+    else {
+        Write-Host ''
+        Write-Host '  Vuoi anche un SECONDO tasto per parlare direttamente con la CENTRALE (da qualsiasi canale)?' -ForegroundColor Cyan
+        $r2 = Read-Host '  Scrivi S e premi INVIO per sceglierlo, oppure premi solo INVIO per saltare'
+        if ($r2 -match '^\s*[sS]') {
+            $vk2 = Select-Key 'chiamare la CENTRALE'
+            if ($vk2 -eq $vk) { Write-Host '  E'' lo stesso tasto che usi per parlare: secondo tasto non usato.' -ForegroundColor Yellow; $vk2 = 0 }
+            else { Write-Host "  OK! Tasto per la Centrale: $(Get-KeyName $vk2)" -ForegroundColor Green }
+            Start-Sleep -Milliseconds 600
+        } else { $vk2 = 0 }
+    }
+    Set-Content -Path $keyFile2 -Value $vk2
+}
 
 Write-Host ''
 Write-Host '  Lascia aperta questa finestra (puoi ridurla a icona) e la radio nel browser.' -ForegroundColor Gray
-Write-Host "  Tieni premuto [$(Get-KeyName $vk)] per parlare. Per chiudere: chiudi questa finestra." -ForegroundColor Gray
+Write-Host "  Tieni premuto [$(Get-KeyName $vk)] per parlare nel tuo canale." -ForegroundColor Gray
+if ($vk2 -gt 0) { Write-Host "  Tieni premuto [$(Get-KeyName $vk2)] per parlare con la CENTRALE." -ForegroundColor Gray }
+Write-Host '  Per chiudere: chiudi questa finestra.' -ForegroundColor Gray
 Write-Host ''
 
 # ------------------------------------------------------------- collegamento e ciclo principale
@@ -119,6 +141,7 @@ while (-not $fatal) {
         [void]$ws.ConnectAsync([Uri]$Server, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
         Send-Msg $ws @{ t = 'remote_auth'; token = $Token }
         $down = $false
+        $down2 = $false
         $lastPing = Get-Date
         $buffer = New-Object byte[] 16384
         $seg = New-Object System.ArraySegment[byte] -ArgumentList @(, $buffer)
@@ -131,6 +154,12 @@ while (-not $fatal) {
             if ($isDown -ne $down) {
                 $down = $isDown
                 Send-Msg $ws @{ t = 'remote_ptt'; down = $down }
+            }
+            # 1b) il tasto per la Centrale (se scelto)
+            $isDown2 = ($vk2 -gt 0) -and [RadioKeys]::IsDown($vk2)
+            if ($isDown2 -ne $down2) {
+                $down2 = $isDown2
+                Send-Msg $ws @{ t = 'remote_ptt'; down = $down2; centrale = $true }
             }
 
             # 2) messaggi dalla radio
@@ -158,7 +187,7 @@ while (-not $fatal) {
                                 switch ($m.state) {
                                     'on' {
                                         if ($m.ascoltatori -gt 0) { Say ">>> IN ONDA su $($m.canale) - ti ascoltano: $($m.ascoltatori)" Red }
-                                        else { Say ">>> IN ONDA su $($m.canale) - nessun altro nel canale" Red }
+                                        else { Say ">>> IN ONDA su $($m.canale) - nessuno ti sta ascoltando adesso" Red }
                                     }
                                     'idle' { Say 'Fine trasmissione.' DarkGray }
                                     'busy' { Say "Canale occupato: sta parlando $($m.da)" Yellow }

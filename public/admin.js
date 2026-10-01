@@ -426,7 +426,7 @@
       const badges = el('div', 'badges');
       if (c.password) badges.append(badge('🔒 password: ' + c.password, 'gold'));
       if (c.ruoli.length) badges.append(badge('👥 solo: ' + c.ruoli.map((id) => R.roleInfo(id).nome).join(', '), 'blue'));
-      if (c.riceveSos) badges.append(badge('🚨 riceve tutti gli SOS', 'red'));
+      if (c.riceveSos) badges.append(badge('🚨 Centrale: SOS e chiamate da tutti', 'red'));
       if (c.eco) badges.append(badge('🔁 canale eco', 'blue'));
       badges.append(badge(`👤 ${c.utenti} dentro`));
       main.append(badges);
@@ -460,7 +460,11 @@
     const desc = input(isNew ? '' : c.descrizione, 'es. Questura di Udine');
     desc.maxLength = 80;
     const pass = input(isNew ? '' : c.password, 'vuota = nessuna password');
-    const sos = checkbox('🚨 Centrale: riceve gli SOS di TUTTI i canali', isNew ? false : c.riceveSos, 'Chi è in questo canale sente la sirena di ogni SOS, da qualsiasi canale.');
+    const sos = checkbox(
+      '🚨 Centrale: riceve SOS, chiamate e richieste da TUTTI i canali',
+      isNew ? false : c.riceveSos,
+      'Chi è in questo canale sente ogni SOS e risponde alle chiamate "📞 Parla con la Centrale" fatte da qualsiasi canale. Il nome di questo canale è anche il nome con cui la Centrale firma i comunicati.'
+    );
     const eco = checkbox('🔁 Canale eco (prova audio)', isNew ? false : c.eco, 'Chi parla qui si risente subito dopo: serve per provare microfono e casse.');
     const roleBox = el('div', 'role-checks');
     const chosen = new Set(isNew ? [] : c.ruoli);

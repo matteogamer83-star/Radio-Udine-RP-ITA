@@ -8,7 +8,8 @@ Una radio stile walkie-talkie (come Zello) per la community **Udine RP ITA**:
 - **Ruoli personalizzati** (Comandante, Vice, Staff…) con permessi decisi **solo dal Founder**
 - **Tasto PTT per Windows**: parli tenendo premuto un tasto **anche dentro al gioco**
 - **🚨 SOS**: sirena, schermata rossa e **una voce che legge la posizione**; arriva anche alla Centrale
-- **📡 Centrale operativa**: chi gestisce emergenze e notizie parla a **più radio insieme** (tutte o solo alcune), sente le loro risposte e manda **comunicati, allerte ed emergenze**
+- **📡 Centrale operativa**: chi gestisce emergenze e notizie parla a **più radio insieme** (tutte o solo alcune), sente le loro risposte e manda **comunicati, allerte ed emergenze**, firmati solo "Centrale"
+- **📞 Parla con la Centrale**: da qualsiasi canale (anche quelli nuovi) chiunque può chiamare la Centrale o mandarle una richiesta scritta, senza cambiare canale
 - Canale **🔁 Prova audio (eco)**: parli e ti risenti subito, così controlli microfono e casse da solo
 - Cronologia con riascolto dei vocali, chat di testo, effetto radio, installabile come app sul telefono
 
@@ -70,7 +71,7 @@ Dal pannello puoi anche dare una nuova password 🔑, disattivare 🚫 (la perso
 
 - **🔒 Password** (vuota = canale libero)
 - **👥 Chi può vederlo**: spunta i ruoli che possono entrare (nessuno spuntato = tutti)
-- **🚨 Centrale**: riceve gli SOS di **tutti** i canali
+- **🚨 Centrale**: riceve SOS, chiamate e richieste da **tutti** i canali. Il suo nome (es. *Centrale Operativa 112*) è quello con cui la Centrale firma i messaggi
 - **🔁 Eco**: canale di prova audio
 
 ## 5. Ruoli personalizzati (solo Founder)
@@ -98,6 +99,8 @@ Il browser da solo sente i tasti solo quando la sua finestra è in primo piano. 
 5. Entra in gioco e **tieni premuto quel tasto**: parli in radio. Nella finestra nera vedi `>>> IN ONDA` e quante persone ti ascoltano
 
 Funziona come il push-to-talk di Discord. Se avvii il gioco "come amministratore", avvia anche il file del tasto come amministratore.
+
+**Secondo tasto per la Centrale**: dopo il primo tasto, la finestra nera chiede se vuoi un secondo tasto. Scrivi `S`, premi INVIO e poi il tasto: tenendolo premuto parli **direttamente con la Centrale**, da qualsiasi canale. Se avevi già il file vecchio, **scaricalo di nuovo** dalle Impostazioni per avere questa opzione.
 Il file contiene il tuo codice personale: **non condividerlo**. Per cambiare tasto riaprilo e scrivi `C`.
 
 ## 7. 📡 Centrale operativa: parlare a più radio insieme
@@ -111,6 +114,11 @@ Sopra al pulsante per parlare compare la barra **📡 CENTRALE**:
 4. **Senti le risposte**: quando qualcuno risponde nel suo canale (es. Polizia) lo senti anche tu. Sul display vedi da quale canale arriva. Il tasto 👂 / 🔇 accende o spegne l'ascolto
 5. **Priorità**: se in un canale scelto qualcuno sta parlando, la Centrale lo interrompe e prende la linea; mentre parla la Centrale nessuno può interromperla
 6. Anche i **messaggi scritti** vanno a tutti i canali scelti
+7. **Tutto quello che manda la Centrale è firmato "Centrale"** (il nome del canale Centrale, es. *Centrale Operativa 112*), mai con il nome dell'operatore. Chi l'ha mandato davvero resta solo nei **Logs** di Render, per sicurezza
+
+**📞 Chiamate dagli altri canali**: quando qualcuno chiama la Centrale lo senti in diretta e il display dice *"📞 CHIAMATA DA 🚓 Polizia di Stato"*.
+Nella barra compare **↩️ Rispondi**: premilo, poi tieni premuto il pulsante e parla. Ti sente quel canale (e il tuo), poi il pulsante torna normale.
+Le chiamate e le richieste arrivano a chi è nel canale Centrale **e** a chi ha il permesso Centrale con **Più canali acceso**, ovunque si trovi.
 
 **📢 Comunicato**: scegli il tipo, scrivi cosa succede, il luogo (facoltativo) e a quali canali (alcuni o tutti):
 
@@ -123,6 +131,15 @@ Sopra al pulsante per parlare compare la barra **📡 CENTRALE**:
 Chi lo riceve preme **Ricevuto**: tu lo vedi subito e in cronologia resta l'elenco di chi ha risposto.
 
 > La Centrale lavora sui canali che il suo ruolo può vedere (anche quelli con password). Per raggiungere anche i canali riservati a certi ruoli, dai alla Centrale anche **Accesso a tutti i canali**.
+
+### Per tutti gli altri: parlare con la Centrale
+
+In ogni canale (tranne quello della Centrale), sopra al pulsante grande c'è **📞 Parla con la Centrale**:
+
+- **Tienilo premuto e parla**: ti sente solo la Centrale, non i colleghi del tuo canale, e non devi cambiare canale. Sotto vedi quante persone ci sono in Centrale in quel momento
+- **✍️ Richiesta**: scrivi cosa ti serve (ci sono scelte rapide: ambulanza, rinforzi, Vigili del Fuoco, carro attrezzi…) e dove sei. In Centrale una voce la legge; quando la prendono in carico ti arriva *"La Centrale ha preso in carico la tua richiesta"*
+- Funziona da tutti i canali, anche quelli creati dopo
+- Si può usare anche un tasto: ⚙️ Impostazioni → **📞 Tasto per chiamare la Centrale** (nel browser), oppure il secondo tasto del programma per Windows (in gioco)
 
 ## 8. 🚨 SOS
 
@@ -153,6 +170,7 @@ I dati sono salvati nella cartella `data` (non cancellarla). Per far entrare ami
 - **Il pulsante dice "SOLO ASCOLTO"**: toccalo e segui le istruzioni (permesso del microfono o link non `https://`).
 - **Il tasto PC non fa niente**: la radio nel browser deve essere aperta e con l'accesso fatto. In ⚙️ deve essere attivo *"Questo browser risponde al tasto PC"*. In alto deve comparire ⌨️.
 - **Render ci mette tanto ad aprirsi**: nel piano gratis dopo 15 minuti senza nessuno si "addormenta"; il primo accesso può richiedere circa un minuto.
+- **Non vedo "📞 Parla con la Centrale"**: serve un canale segnato come *Centrale* (🛡️ → Canali). Non compare se sei già nel canale della Centrale o se hai il permesso Centrale (in quel caso la Centrale sei tu).
 - **Non vedo la barra 📡 CENTRALE**: serve il permesso *Centrale operativa* (il Founder ce l'ha). Dopo un aggiornamento della radio ricarica la pagina (F5).
 - **Ho perso la password del Founder**: un altro con «Gestire gli utenti» non può cambiarla. Ripristina un backup oppure cancella i dati (Gist o cartella `data`) e rifai la prima accensione.
-- **Controllo automatico**: apri PowerShell in questa cartella e scrivi `npm test` (simula Founder, Staff, Centrale e utenti e verifica 80 cose).
+- **Controllo automatico**: apri PowerShell in questa cartella e scrivi `npm test` (simula Founder, Staff, Centrale e utenti e verifica 93 cose).

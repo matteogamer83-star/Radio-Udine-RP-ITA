@@ -263,6 +263,10 @@ async function main() {
     ok(kon.canale === 'Generale' && kon.ascoltatori === 1, 'il tasto PC mostra "IN ONDA" e quante persone ascoltano');
     send(K, { t: 'remote_ptt', down: false });
     ok((await waitFor(M, 'remote_ptt')).down === false, 'tasto PC rilasciato → la radio chiude la trasmissione');
+    send(K, { t: 'remote_ptt', down: true, centrale: true });
+    ok((await waitFor(M, 'remote_ptt')).centrale === true, 'secondo tasto PC: chiama la Centrale');
+    send(K, { t: 'remote_ptt', down: false, centrale: true });
+    await waitFor(M, 'remote_ptt', (m) => !m.down);
     send(M, { t: 'ptt_stop' });
     await waitFor(K, 'remote_state', (m) => m.state === 'idle');
     send(K, { t: 'remote_ptt', down: true });
@@ -338,12 +342,13 @@ async function main() {
     ok(dok.canali === 3 && dok.ascoltatori === 3, `la Centrale parla a 3 canali insieme (${dok.ascoltatori} persone in ascolto)`);
     const [tsP, tsL, tsG] = await Promise.all([waitFor(P, 'talk_start'), waitFor(L, 'talk_start'), waitFor(G, 'talk_start')]);
     ok(tsP.prio && tsP.canali === 3 && tsL.prio && tsG.prio, 'Polizia, 118 e Centrale ricevono la diramazione');
+    ok(tsP.user.nome === 'Centrale Operativa 112' && tsP.user.uid === 'centrale' && !JSON.stringify(tsP).includes('Sara'), 'chi riceve vede "Centrale Operativa 112", NON il nome della persona');
     const dAudio = tone(500, 700);
     for (let i = 0; i < dAudio.length; i += 1280) D.ws.send(dAudio.subarray(i, i + 1280));
     send(D, { t: 'ptt_stop' });
     const [teP] = await Promise.all([
-      waitFor(P, 'talk_end', (m) => m.user.nome === 'Sara Gialli'),
-      waitFor(L, 'talk_end', (m) => m.user.nome === 'Sara Gialli'),
+      waitFor(P, 'talk_end', (m) => m.user.uid === 'centrale'),
+      waitFor(L, 'talk_end', (m) => m.user.uid === 'centrale'),
     ]);
     ok(Buffer.concat(P.bins).equals(dAudio) && Buffer.concat(L.bins).equals(dAudio), 'Polizia e 118 sentono la Centrale in diretta, audio intatto');
     ok((await noMsg(C, 'talk_start', 200)) && C.bins.length === 0 && M.bins.length === 0, 'i canali non scelti (Carabinieri, Generale) non sentono niente');
@@ -355,12 +360,12 @@ async function main() {
     await waitFor(M, 'ptt_ok');
     send(D, { t: 'ptt_start', diramazione: true, canali: ['generale'] });
     const cut = await waitFor(M, 'ptt_cut');
-    ok(cut.by.nome === 'Sara Gialli' && (await waitFor(D, 'ptt_ok')).canali === 2, 'PRIORITÀ: la Centrale interrompe chi sta parlando e prende la linea');
+    ok(cut.by.nome === 'Centrale Operativa 112' && (await waitFor(D, 'ptt_ok')).canali === 2, 'PRIORITÀ: la Centrale interrompe chi sta parlando e prende la linea');
     send(M, { t: 'ptt_start' });
     const busy = await waitFor(M, 'ptt_busy');
-    ok(busy.prio && busy.by.nome === 'Sara Gialli', 'mentre parla la Centrale nessuno può interromperla');
+    ok(busy.prio && busy.by.nome === 'Centrale Operativa 112', 'mentre parla la Centrale nessuno può interromperla');
     send(D, { t: 'ptt_stop' });
-    await waitFor(M, 'talk_end', (m) => m.user.nome === 'Sara Gialli');
+    await waitFor(M, 'talk_end', (m) => m.user.uid === 'centrale');
     P.msgs = [];
     send(M, { t: 'ptt_start', diramazione: true, canali: ['polizia'] });
     ok((await waitFor(M, 'ptt_ok')).canali === 1 && (await noMsg(P, 'talk_start', 300)), 'un utente normale NON può parlare su più canali');
@@ -369,7 +374,7 @@ async function main() {
     // messaggi scritti e comunicati
     send(D, { t: 'text', text: 'Tutte le unità: posto di blocco in via Roma', diramazione: true, canali: ['polizia', '118'] });
     const [txP, txL] = await Promise.all([waitFor(P, 'text'), waitFor(L, 'text')]);
-    ok(txP.msg.testo === txL.msg.testo && txP.msg.canali === 3, 'la Centrale scrive a più canali insieme');
+    ok(txP.msg.testo === txL.msg.testo && txP.msg.canali === 3 && txP.msg.from.nome === 'Centrale Operativa 112', 'la Centrale scrive a più canali insieme (firmato "Centrale")');
     send(M, { t: 'annuncio', livello: 'info', text: 'ciao', canali: ['polizia'] });
     ok((await waitFor(M, 'error')).code === 'perm', 'un utente normale NON può mandare comunicati');
     G.msgs = [];
@@ -377,8 +382,10 @@ async function main() {
     const [anP, anL, anD] = await Promise.all([waitFor(P, 'annuncio'), waitFor(L, 'annuncio'), waitFor(D, 'annuncio')]);
     ok(anP.msg.livello === 'emergenza' && anP.msg.luogo === 'Piazza Libertà' && anL.msg.testo === 'Rapina in corso alla banca', 'COMUNICATO di emergenza con luogo arriva ai canali scelti');
     ok(anD.mio && anD.persone === 2 && (await noMsg(G, 'annuncio', 300)) && (await noMsg(C, 'annuncio', 50)), 'chi lo manda sa a quante persone è arrivato; gli altri canali non lo ricevono');
+    ok(anP.msg.from.nome === 'Centrale Operativa 112' && !JSON.stringify(anP).includes('Sara'), 'il comunicato compare come "Centrale Operativa 112", senza il nome di chi lo manda');
     send(P, { t: 'annuncio_ack', id: anP.msg.id });
-    ok((await waitFor(D, 'annuncio_ack')).by.nome === 'Paolo Blu', 'la Centrale vede chi ha risposto "Ricevuto"');
+    const ack = await waitFor(D, 'annuncio_ack');
+    ok(ack.by.nome === 'Paolo Blu' && ack.mio, 'la Centrale vede chi ha risposto "Ricevuto"');
 
     // i canali creati dopo compaiono subito e si possono usare
     await req(F, 'channel_save', { nome: 'Rapina Banca', icona: '🏦' });
@@ -394,6 +401,49 @@ async function main() {
     send(D, { t: 'annuncio', livello: 'allerta', text: 'Allerta meteo: grandine in arrivo', tutti: true });
     const anC = await waitFor(C, 'annuncio');
     ok(anC.msg.tutti && anC.msg.livello === 'allerta' && !!(await waitFor(M, 'annuncio')), 'comunicato a TUTTI i canali: arriva ovunque, anche nel canale nuovo');
+
+    // ---------------------------------------------------- tutti i canali parlano con la Centrale
+    ok(M.welcome.centrale && M.welcome.centrale.nome === 'Centrale Operativa 112', 'ogni radio sa qual è la Centrale');
+    for (const r of [M, L, G, P, C, D, F]) {
+      r.msgs = [];
+      r.bins = [];
+    }
+    send(F, { t: 'join', channel: 'generale' });
+    await waitFor(F, 'joined');
+    send(F, { t: 'monitor', canali: [], attivo: true }); // il Founder è "in servizio" come Centrale da un altro canale
+    await sleep(100);
+    send(P, { t: 'ptt_start', centrale: true });
+    const cok = await waitFor(P, 'ptt_ok');
+    const [cG, cD, cF] = await Promise.all([waitFor(G, 'talk_start'), waitFor(D, 'talk_start'), waitFor(F, 'talk_start')]);
+    ok(cok.chiamata && cG.chiamata.id === 'polizia' && cD.user.nome === 'Paolo Blu', 'dalla Polizia si chiama la Centrale senza cambiare canale');
+    ok(cF.chiamata && cok.ascoltatori === 3, `la chiamata arriva anche a chi è in servizio come Centrale da un altro canale (${cok.ascoltatori} persone)`);
+    const cAudio = tone(400, 600);
+    for (let i = 0; i < cAudio.length; i += 1280) P.ws.send(cAudio.subarray(i, i + 1280));
+    send(M, { t: 'ptt_start', centrale: true });
+    const cbusy = await waitFor(M, 'ptt_busy');
+    ok(cbusy.centrale && cbusy.by.nome === 'Paolo Blu', "se la Centrale è già occupata da un'altra chiamata: «Centrale occupata»");
+    send(P, { t: 'ptt_stop' });
+    const cEnd = await waitFor(G, 'talk_end', (m) => m.user.nome === 'Paolo Blu');
+    const pEnd = await waitFor(P, 'talk_end', (m) => m.user.nome === 'Paolo Blu');
+    ok(Buffer.concat(G.bins).equals(cAudio) && (await noMsg(C, 'talk_start', 100)) && M.bins.length === 0, 'la Centrale sente la chiamata; gli altri canali no');
+    const myCall = await fetch(`http://127.0.0.1:${PORT}/api/msg/${pEnd.msg.centrale.id}/${pEnd.msg.id}.wav?k=${P.welcome.key}`);
+    ok(cEnd.msg.chiamata.id === 'polizia' && myCall.ok, 'la chiamata resta registrata in Centrale e chi ha chiamato può riascoltarla');
+    send(C, { t: 'ptt_start', centrale: true });
+    await waitFor(C, 'ptt_ok');
+    ok((await waitFor(G, 'talk_start', (m) => m.chiamata)).chiamata.id === rb.id, 'anche dal canale appena creato si chiama la Centrale');
+    send(C, { t: 'ptt_stop' });
+    await waitFor(G, 'talk_end', (m) => m.user.nome === 'Carlo Viola');
+
+    // richiesta scritta
+    send(C, { t: 'richiesta', text: "Serve un'ambulanza", luogo: 'Banca di Piazza Libertà' });
+    const [rG, rF, rC] = await Promise.all([waitFor(G, 'richiesta'), waitFor(F, 'richiesta'), waitFor(C, 'richiesta')]);
+    ok(rG.msg.testo === "Serve un'ambulanza" && rG.msg.canale.id === rb.id && !!rF && rC.mio && rC.persone === 3, 'RICHIESTA scritta alla Centrale (es. ambulanza) con il luogo');
+    ok(await noMsg(M, 'richiesta', 200), 'le richieste arrivano solo alla Centrale');
+    send(M, { t: 'richiesta_ack', id: rG.msg.id });
+    send(D, { t: 'richiesta_ack', id: rG.msg.id });
+    const rAck = await waitFor(C, 'richiesta_ack');
+    ok(rAck.mio && rAck.by.nome === 'Centrale Operativa 112' && (await waitFor(G, 'richiesta_ack')).by.nome === 'Sara Gialli', "la Centrale prende in carico: chi ha chiesto vede «Centrale», in Centrale si vede l'operatore");
+    send(F, { t: 'monitor', canali: [], attivo: false });
 
     // ---------------------------------------------------- canale eco (prova audio da soli)
     await joinCh(M, 'prova-audio');

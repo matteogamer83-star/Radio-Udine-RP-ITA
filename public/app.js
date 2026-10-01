@@ -6,7 +6,7 @@
 (function () {
   const SR = 16000; // frequenza dell'audio trasmesso
   const APP_NAME = 'Radio Udine RP';
-  const APP_VERSION = '2.1.0'; // uguale a package.json: se il server è più nuovo la pagina si ricarica da sola
+  const APP_VERSION = '2.2.0'; // uguale a package.json: se il server è più nuovo la pagina si ricarica da sola
   const PROTO = 3; // audio con il numero della trasmissione (per sentire più canali insieme)
 
   // ================================================================ utilità
@@ -44,6 +44,7 @@
     radioFx: true,
     pttMode: 'hold', // hold = tieni premuto, toggle = premi una volta
     pttKey: 'Space',
+    callKey: '', // tasto per chiamare la Centrale (nessuno finché non lo scegli)
     beeps: true,
     vibrate: true,
     wakeLock: true,
@@ -75,7 +76,9 @@
     pendingJoin: null,
     pcKeys: 0,
     tx: 'idle', // idle | pending | on | stopping
+    txMode: null, // null = canale normale | 'call' = chiamata alla Centrale | 'disp' = parlo come Centrale
     txInfo: {}, // risposta del server: canali, ascoltatori, saltati
+    centrale: null, // { id, nome, icona, persone } della Centrale (se esiste)
     pttHeld: false,
     pttSource: null,
     preBuffer: [],
@@ -88,6 +91,7 @@
     busyUntil: 0,
     busyBy: null,
     busyPrio: false,
+    busyCentrale: false,
   };
 
   function roleInfo(id) {
@@ -555,6 +559,12 @@
         case 'error':
           this.tone(300, t, 0.2, { type: 'square', vol: 0.07 });
           break;
+        case 'call': // chiamata alla Centrale: doppio squillo
+          for (let i = 0; i < 2; i++) {
+            this.tone(1320, t + i * 0.22, 0.08, { vol: 0.12 });
+            this.tone(1660, t + i * 0.22 + 0.09, 0.08, { vol: 0.12 });
+          }
+          break;
         case 'prio': // parla la Centrale: tre note in salita
           this.tone(988, t, 0.07, { vol: 0.12 });
           this.tone(1319, t + 0.08, 0.07, { vol: 0.12 });
@@ -771,6 +781,7 @@
     state.maxTalk = m.maxTalk || 60;
     state.serverName = m.server || state.serverName;
     state.pcKeys = m.pcKeys || 0;
+    state.centrale = m.centrale || null;
     if (m.channel) state.channel = m.channel;
     $('#sideServer').textContent = state.serverName;
     ui.channels();
@@ -780,6 +791,7 @@
     ui.adminButtons();
     disp.render();
     disp.syncMonitor();
+    ui.callBar();
     ui.ptt();
     ui.lcd();
     if (RadioApp.onSession) RadioApp.onSession();
@@ -843,6 +855,7 @@
         break;
       case 'channels':
         state.channels = m.channels || [];
+        if ('centrale' in m) state.centrale = m.centrale || null;
         if (state.channel) {
           const c = state.channels.find((x) => x.id === state.channel.id);
           if (c) state.channel = c;
@@ -851,6 +864,7 @@
         ui.header();
         disp.render();
         disp.syncMonitor();
+        ui.callBar();
         ui.ptt();
         break;
       case 'channel_gone':
@@ -880,6 +894,7 @@
         ui.feedReset(m.feed || []);
         disp.render();
         disp.syncMonitor();
+        ui.callBar();
         ui.ptt();
         if (m.talker) rx.start(m.talker, true);
         else ui.lcd();
@@ -907,8 +922,8 @@
         rx.end(m);
         break;
       case 'text':
-        ui.feedAdd(Object.assign({}, m.msg, { via: m.via || null }));
-        if (!isMine(m.msg.from)) {
+        ui.feedAdd(Object.assign({}, m.msg, { via: m.via || null, mio: !!m.mio }));
+        if (!m.mio && !isMine(m.msg.from)) {
           audio.sfx('text');
           vibrate(20);
         }
@@ -925,11 +940,20 @@
       case 'annuncio_ack':
         onAnnuncioAck(m);
         break;
+      case 'richiesta':
+        onRichiesta(m);
+        break;
+      case 'richiesta_ack':
+        onRichiestaAck(m);
+        break;
       case 'ptt_ok':
         ptt.onOk(m);
         break;
       case 'ptt_busy':
-        ptt.onBusy(m.by, m.prio);
+        ptt.onBusy(m.by, m.prio, m.centrale);
+        break;
+      case 'ptt_fail':
+        ptt.onFail(m.msg);
         break;
       case 'ptt_timeout':
         ptt.onTimeout();
@@ -938,7 +962,7 @@
         ptt.onCut(m.by);
         break;
       case 'remote_ptt':
-        onRemotePtt(!!m.down);
+        onRemotePtt(!!m.down, !!m.centrale);
         break;
       case 'pc_key':
         state.pcKeys = m.n || 0;
@@ -1076,7 +1100,8 @@
       if (old) return ui.lcd();
       if (!t.via) audio.stopReplay();
       audio.resume();
-      if (!silent) audio.sfx(t.prio ? 'prio' : 'rxStart');
+      if (t.chiamata) disp.noteCall(t.chiamata, t.user);
+      if (!silent) audio.sfx(t.chiamata ? 'call' : t.prio ? 'prio' : 'rxStart');
       vibrate(t.prio ? [50, 40, 50] : 25);
       ui.lcd();
       ui.users();
@@ -1152,7 +1177,8 @@
   const ptt = {
     sid: 0,
 
-    down() {
+    /** mode: 'call' = chiama la Centrale da qualsiasi canale */
+    down(mode) {
       if (state.tx !== 'idle' || micTest.running) return;
       if (!state.online || !state.channel) {
         toast('Non sei collegato a nessun canale');
@@ -1165,14 +1191,28 @@
       }
       audio.resume();
       audio.stopReplay();
+      if (mode === 'call' && !canCall()) {
+        // nel canale della Centrale (o senza Centrale) il tasto "chiama" parla normalmente nel canale
+        if (!state.centrale) toast("Non c'è una Centrale: chiedi al Founder di crearla");
+        mode = null;
+      }
       state.tx = 'pending';
       state.pttHeld = true;
       state.preBuffer = [];
       state.txInfo = {};
       const sid = ++this.sid;
       audio.startCapture(sid, { pcm: (b) => this.onPcm(b, sid), final: () => this.onFinal(sid) });
-      // Centrale con "più canali" attivo: parla anche ai canali collegati, con priorità
-      net.send(disp.active() ? { t: 'ptt_start', diramazione: true, canali: disp.targetIds() } : { t: 'ptt_start' });
+      if (mode === 'call') {
+        state.txMode = 'call';
+        net.send({ t: 'ptt_start', centrale: true });
+      } else if (disp.sending()) {
+        // la Centrale: parla ai canali collegati (o risponde a chi l'ha chiamata), con priorità
+        state.txMode = 'disp';
+        net.send({ t: 'ptt_start', diramazione: true, canali: disp.sendIds() });
+      } else {
+        state.txMode = null;
+        net.send({ t: 'ptt_start' });
+      }
       clearTimeout(state.pendingTimer);
       state.pendingTimer = setTimeout(() => {
         if (state.tx === 'pending') {
@@ -1240,14 +1280,23 @@
       audio.sfx('end');
     },
 
-    onBusy(by, prio) {
+    onBusy(by, prio, centrale) {
       if (state.tx !== 'pending') return;
       audio.stopCapture(this.sid);
       this.sid++;
       this.reset();
       audio.sfx('busy');
       vibrate([60, 60, 60]);
-      ui.busy(by, prio);
+      ui.busy(by, prio, centrale);
+    },
+
+    onFail(msg) {
+      if (state.tx !== 'pending') return;
+      audio.stopCapture(this.sid);
+      this.sid++;
+      this.reset();
+      audio.sfx('error');
+      toast(msg || 'Non è possibile parlare adesso', 6000);
     },
 
     // la Centrale ha preso la linea mentre parlavi
@@ -1258,7 +1307,7 @@
       this.reset();
       audio.sfx('busy');
       vibrate([80, 60, 80]);
-      toast(`📡 ${displayName(by)} (Centrale) ha preso la linea: la tua trasmissione è stata interrotta`, 6000);
+      toast(`📡 La Centrale (${displayName(by)}) ha preso la linea: la tua trasmissione è stata interrotta`, 6000);
     },
 
     onTimeout() {
@@ -1281,8 +1330,12 @@
     reset() {
       clearTimeout(state.pendingTimer);
       clearTimeout(state.stopTimer);
+      const spoke = state.tx === 'on' || state.tx === 'stopping';
+      if (spoke && state.txMode === 'disp') disp.replied(); // la risposta a chi ha chiamato è stata data
       state.tx = 'idle';
+      state.txMode = null;
       state.preBuffer = [];
+      ui.callBar();
       ui.lcd();
       ui.users();
       ui.ptt();
@@ -1291,18 +1344,27 @@
   };
 
   // Tasto PTT per Windows (programmino che funziona anche col gioco in primo piano)
-  function onRemotePtt(down) {
+  // (secondo tasto, se scelto: chiama la Centrale)
+  function onRemotePtt(down, centrale) {
     if (!settings.tastoPc || !state.loggedIn) return;
+    const src = centrale ? 'remoteCall' : 'remote';
     if (down) {
-      if (settings.pttMode === 'toggle') ptt.toggle();
-      else if (state.tx === 'idle') {
-        state.pttSource = 'remote';
-        ptt.down();
+      if (settings.pttMode === 'toggle') {
+        if (state.tx === 'idle') ptt.down(centrale ? 'call' : null);
+        else ptt.up();
+      } else if (state.tx === 'idle') {
+        state.pttSource = src;
+        ptt.down(centrale ? 'call' : null);
       }
-    } else if (settings.pttMode === 'hold' && state.pttSource === 'remote') {
+    } else if (settings.pttMode === 'hold' && state.pttSource === src) {
       state.pttSource = null;
       ptt.up();
     }
+  }
+
+  /** Posso chiamare la Centrale da qui? (c'è una Centrale e non sono già nel suo canale) */
+  function canCall() {
+    return !!state.centrale && !!state.channel && !state.channel.sos && !state.channel.eco;
   }
 
   // Registra 3 secondi e li fa riascoltare (solo in locale, niente viene inviato)
@@ -1383,8 +1445,9 @@
       const where = isSos ? m.testo : m.luogo;
       $('#sosOverlay').dataset.kind = kind;
       $('#sosTitle').textContent = K.title;
-      $('#sosWho').textContent = displayName(m.from);
-      $('#sosRole').textContent = `${r.icona} ${r.nome}`;
+      const daCentrale = m.from.ruolo === 'centrale';
+      $('#sosWho').textContent = (daCentrale ? '📡 ' : '') + displayName(m.from);
+      $('#sosRole').textContent = daCentrale ? 'Comunicazione ufficiale della Centrale' : `${r.icona} ${r.nome}`;
       $('#sosText').hidden = isSos;
       $('#sosText').textContent = isSos ? '' : m.testo;
       $('#sosWhereBox').hidden = !isSos && !where;
@@ -1416,11 +1479,12 @@
         const dove = m.testo ? `Posizione: ${m.testo}. Ripeto: ${m.testo}.` : 'Posizione non indicata.';
         speak(`Attenzione! S O S da ${chi}, ${r.nome}. ${dove} Canale ${m.canale.nome}.`);
       } else if (this.kind === 'emergenza') {
-        speak(`Emergenza! ${chi} comunica: ${m.testo}.` + (m.luogo ? ` Luogo: ${m.luogo}. Ripeto: ${m.luogo}.` : ` Ripeto: ${m.testo}.`));
+        // i comunicati arrivano sempre "dalla Centrale", senza il nome di chi li manda
+        speak(`Emergenza! La Centrale comunica: ${m.testo}.` + (m.luogo ? ` Luogo: ${m.luogo}. Ripeto: ${m.luogo}.` : ` Ripeto: ${m.testo}.`));
       } else if (this.kind === 'allerta') {
-        speak(`Attenzione, allerta da ${chi}: ${m.testo}.` + (m.luogo ? ` Luogo: ${m.luogo}.` : '') + ` Ripeto: ${m.testo}.`);
+        speak(`Attenzione, allerta dalla Centrale: ${m.testo}.` + (m.luogo ? ` Luogo: ${m.luogo}.` : '') + ` Ripeto: ${m.testo}.`);
       } else {
-        speak(`Comunicato da ${chi}: ${m.testo}.` + (m.luogo ? ` Luogo: ${m.luogo}.` : ''));
+        speak(`Comunicato della Centrale: ${m.testo}.` + (m.luogo ? ` Luogo: ${m.luogo}.` : ''));
       }
     },
     ack() {
@@ -1453,7 +1517,7 @@
   function notifyAlarm(kind, m) {
     if (!settings.notifiche || !('Notification' in window) || Notification.permission !== 'granted' || !document.hidden) return;
     const isSos = kind === 'sos';
-    const title = `${isSos ? '🚨 SOS' : KINDS[kind].title} — ${displayName(m.from)}`;
+    const title = isSos ? `🚨 SOS — ${displayName(m.from)}` : `${KINDS[kind].title} — Centrale`;
     const body = isSos ? `📍 ${m.testo || 'Posizione non indicata'} · ${m.canale.nome}` : m.testo + (m.luogo ? ` · 📍 ${m.luogo}` : '');
     const opts = { body, tag: m.id, requireInteraction: kind !== 'info', icon: 'icons/icon-192.png' };
     const fallback = () => {
@@ -1517,11 +1581,102 @@
     const name = displayName(m.by);
     ui.addAck(m.id, name);
     if (alarm.current && alarm.current.id === m.id) alarm.addAck(name + (isMine(m.by) ? ' (tu)' : ''));
-    if (isMine(m.annuncio.from) && !isMine(m.by)) {
+    if (m.mio && !isMine(m.by)) {
       toast(`✅ ${name} ha ricevuto il comunicato`, 5000);
       audio.sfx('permit');
       if (m.annuncio.livello === 'emergenza') speak(`${m.by.nome} interviene.`);
     }
+  }
+
+  // ---------------------------------------------------------------- richieste scritte alla Centrale
+  function onRichiesta(m) {
+    const r = m.msg;
+    ui.feedAdd(Object.assign({}, r, { via: m.via || null, mio: !!m.mio }));
+    if (m.mio) {
+      audio.sfx('permit');
+      toast(
+        m.persone ? `📞 Richiesta inviata alla Centrale (la leggono ${m.persone} ${m.persone === 1 ? 'persona' : 'persone'})` : "📞 Richiesta inviata. In Centrale ora non c'è nessuno: la troveranno appena entrano",
+        6000
+      );
+      return;
+    }
+    // in Centrale: avviso, voce che legge la richiesta e risposta veloce
+    disp.noteCall(r.canale, r.from);
+    audio.sfx('call');
+    vibrate([120, 80, 120]);
+    toast(`📞 ${displayName(r.from)} (${r.canale.icona} ${r.canale.nome}): ${r.testo}`, 8000);
+    if (!settings.muted) {
+      const chi = (r.from.sigla ? r.from.sigla + ', ' : '') + r.from.nome;
+      setTimeout(() => speak(`Richiesta da ${chi}, ${r.canale.nome}: ${r.testo}.` + (r.luogo ? ` Luogo: ${r.luogo}.` : '')), 700);
+    }
+  }
+
+  function onRichiestaAck(m) {
+    ui.addAck(m.id, displayName(m.by));
+    if (m.mio) {
+      toast('✅ La Centrale ha preso in carico la tua richiesta', 6000);
+      audio.sfx('permit');
+      speak('La Centrale ha ricevuto la tua richiesta.');
+    }
+  }
+
+  // Richiesta scritta: per dire alla Centrale cosa ti serve anche senza parlare
+  const RICHIESTE = [
+    "🚑 Serve un'ambulanza",
+    '🚓 Servono rinforzi',
+    '🚒 Servono i Vigili del Fuoco',
+    '🔧 Serve un carro attrezzi',
+    '📍 Sono arrivato sul posto',
+    '✅ Situazione risolta',
+  ];
+  function openRequest() {
+    if (!state.online || !canCall()) return toast(state.centrale ? 'Sei già nel canale della Centrale: scrivi qui sotto' : "Non c'è una Centrale");
+    const testo = el('textarea', 'input');
+    testo.rows = 2;
+    testo.maxLength = 200;
+    testo.placeholder = "Cosa ti serve? es. Serve un'ambulanza, c'è un ferito";
+    const quick = el('div', 'quick-row');
+    for (const q of RICHIESTE) {
+      const b = el('button', 'btn btn-sm', q);
+      b.type = 'button';
+      b.onclick = () => {
+        testo.value = q.replace(/^\S+\s/, '');
+        testo.focus();
+      };
+      quick.append(b);
+    }
+    const luogo = el('input', 'input');
+    luogo.maxLength = 80;
+    luogo.placeholder = 'es. Via Roma, davanti alla banca (facoltativo)';
+    const body = el('div', 'form-grid');
+    const c = state.centrale;
+    body.append(
+      el('p', 'muted small', `La richiesta arriva a ${c.icona} ${c.nome}: una voce la legge e ti rispondono appena possono.`),
+      formField('Scelta rapida', quick),
+      formField('Cosa ti serve', testo),
+      formField('📍 Dove sei', luogo)
+    );
+    modal.open({
+      title: '📞 Richiesta alla Centrale',
+      body,
+      actions: [
+        { label: 'Annulla' },
+        {
+          label: '📞 Invia',
+          cls: 'btn-primary',
+          primary: true,
+          onClick: () => {
+            const text = testo.value.trim();
+            if (!text) {
+              toast('Scrivi cosa ti serve (o tocca una scelta rapida)');
+              return false;
+            }
+            net.send({ t: 'richiesta', text, luogo: luogo.value.trim() });
+          },
+        },
+      ],
+    });
+    setTimeout(() => testo.focus(), 60);
   }
 
   function openSos() {
@@ -1587,16 +1742,61 @@
     targetIds() {
       return this.targets().map((c) => c.id);
     },
-    /** Dice al server quali canali ascoltare oltre al mio */
+
+    // ---- chiamate ricevute e risposta veloce
+    lastCall: null, // { canale, user, ts }
+    reply: null, // canale a cui risponde la prossima trasmissione
+    noteCall(canale, user) {
+      if (!this.allowed() || !canale) return;
+      this.lastCall = { canale, user, ts: Date.now() };
+      this.render();
+    },
+    armReply(canale) {
+      if (!this.allowed() || !canale) return;
+      if (state.channel && canale.id === state.channel.id) return toast('Sei già in quel canale: tieni premuto e parla');
+      this.reply = { ...canale, ts: Date.now() };
+      this.render();
+      ui.ptt();
+      ui.lcd();
+      toast(`↩️ Tieni premuto e parla: rispondi a ${canale.icona} ${canale.nome}`, 4000);
+    },
+    cancelReply() {
+      this.reply = null;
+      this.render();
+      ui.ptt();
+      ui.lcd();
+    },
+    replied() {
+      if (!this.reply) return;
+      if (this.lastCall && this.lastCall.canale.id === this.reply.id) this.lastCall = null;
+      this.reply = null;
+      this.render();
+    },
+    replyTarget() {
+      if (this.reply && Date.now() - this.reply.ts > 3 * 60000) this.reply = null; // dopo 3 minuti si annulla
+      return this.allowed() && state.channel && !state.channel.eco ? this.reply : null;
+    },
+    /** La prossima trasmissione va "come Centrale" (più canali o risposta) */
+    sending() {
+      return this.active() || !!this.replyTarget();
+    },
+    sendIds() {
+      const r = this.replyTarget();
+      const ids = this.targetIds();
+      if (r && !ids.includes(r.id)) ids.unshift(r.id);
+      return ids;
+    },
+
+    /** Dice al server quali canali ascoltare oltre al mio, e se sono "in servizio" come Centrale */
     syncMonitor() {
       if (!state.online) return;
       const cur = state.channel && state.channel.id;
-      const ids =
-        this.allowed() && this.cfg.on && this.cfg.ascolta ? this.eligible().filter((c) => c.id !== cur && this.linked(c.id)).map((c) => c.id) : [];
-      const key = ids.join(',');
+      const attivo = this.allowed() && this.cfg.on;
+      const ids = attivo && this.cfg.ascolta ? this.eligible().filter((c) => c.id !== cur && this.linked(c.id)).map((c) => c.id) : [];
+      const key = (attivo ? 'on:' : 'off:') + ids.join(',');
       if (key === this.lastMon) return;
       this.lastMon = key;
-      net.send({ t: 'monitor', canali: ids });
+      net.send({ t: 'monitor', canali: ids, attivo });
     },
     changed() {
       this.save();
@@ -1667,6 +1867,28 @@
       news.onclick = () => openNews();
       head.append(news);
       bar.append(head);
+
+      // chi ha chiamato la Centrale: risposta con un tocco
+      const r = this.replyTarget();
+      if (this.lastCall && Date.now() - this.lastCall.ts > 10 * 60000) this.lastCall = null;
+      if (r) {
+        const row = el('div', 'disp-reply on');
+        row.append(el('span', null, `↩️ RISPONDI A ${r.icona} ${r.nome}: tieni premuto il pulsante e parla`));
+        const x = el('button', 'disp-btn', '✖ Annulla');
+        x.type = 'button';
+        x.onclick = () => this.cancelReply();
+        row.append(x);
+        bar.append(row);
+      } else if (this.lastCall) {
+        const c = this.lastCall;
+        const row = el('div', 'disp-reply');
+        row.append(el('span', null, `📞 ${fmtTime(c.ts)} · ${displayName(c.user)} da ${c.canale.icona} ${c.canale.nome}`));
+        const b = el('button', 'disp-btn answer', '↩️ Rispondi');
+        b.type = 'button';
+        b.onclick = () => this.armReply(c.canale);
+        row.append(b);
+        bar.append(row);
+      }
       if (!this.cfg.on) return;
 
       const row = el('div', 'disp-chips');
@@ -1794,6 +2016,8 @@
     showApp() {
       $('#login').hidden = true;
       $('#app').hidden = false;
+      disp.render();
+      this.callBar();
       this.ptt();
       this.lcd();
     },
@@ -1913,15 +2137,24 @@
         sub = 'Controlla la connessione internet';
       } else if (state.tx === 'pending') {
         mode = 'tx';
-        const n = disp.targets().length + 1;
-        top = n > 1 ? '● CENTRALE: RICHIESTA LINEA' : '● RICHIESTA CANALE';
+        const n = disp.sendIds().length + 1;
+        if (state.txMode === 'call') {
+          top = '● CHIAMO LA CENTRALE';
+          sub = state.centrale ? `${state.centrale.icona} ${state.centrale.nome}` : '';
+        } else {
+          top = state.txMode === 'disp' ? '● CENTRALE: RICHIESTA LINEA' : '● RICHIESTA CANALE';
+          sub = n > 1 ? `📡 ${n} canali` : ch ? `${ch.icona} ${ch.nome}` : '';
+        }
         name = 'Attendi…';
-        sub = n > 1 ? `📡 ${n} canali` : ch ? `${ch.icona} ${ch.nome}` : '';
       } else if (state.tx === 'on' || state.tx === 'stopping') {
         mode = 'tx';
         const info = state.txInfo || {};
         const people = (k) => `👂 ti ${k === 1 ? 'ascolta 1 persona' : `ascoltano ${k} persone`} in diretta`;
-        if (info.canali > 1) {
+        if (state.txMode === 'call') {
+          top = '● IN CHIAMATA CON LA CENTRALE';
+          name = state.centrale ? `📞 ${state.centrale.nome}` : '📞 Centrale';
+          sub = info.ascoltatori ? people(info.ascoltatori) : "⚠️ in Centrale ora non c'è nessuno: il messaggio resta registrato";
+        } else if (info.canali > 1) {
           top = '● CENTRALE IN ONDA';
           name = `📡 Parli a ${info.canali} canali`;
           sub = info.ascoltatori ? people(info.ascoltatori) : '⚠️ in questi canali non c\'è nessuno';
@@ -1935,19 +2168,37 @@
         }
       } else if (Date.now() < state.busyUntil && state.busyBy) {
         mode = 'busy';
-        top = state.busyPrio ? '✖ PARLA LA CENTRALE' : '✖ CANALE OCCUPATO';
         name = displayName(state.busyBy);
-        sub = state.busyPrio ? '📡 comunicazione prioritaria — aspetta che finisca' : 'sta già parlando — aspetta il tuo turno';
+        if (state.busyPrio) {
+          top = '✖ PARLA LA CENTRALE';
+          sub = '📡 comunicazione prioritaria — aspetta che finisca';
+        } else if (state.busyCentrale) {
+          top = '✖ CENTRALE OCCUPATA';
+          sub = 'sta parlando con la Centrale — riprova tra poco';
+        } else {
+          top = '✖ CANALE OCCUPATO';
+          sub = 'sta già parlando — aspetta il tuo turno';
+        }
       } else if (rx.latest()) {
         const t = rx.latest();
         const r = roleInfo(t.user.ruolo);
         const more = rx.talks.size > 1 ? ` · +${rx.talks.size - 1}` : '';
-        mode = t.prio ? 'prio' : 'rx';
-        if (t.prio) top = (t.canali > 1 ? `📡 CENTRALE · ${t.canali} CANALI` : '📡 CENTRALE') + more;
-        else if (t.via) top = `👂 ${t.via.icona} ${t.via.nome}` + more;
-        else top = '▶ IN DIRETTA' + more;
+        mode = t.prio ? 'prio' : t.chiamata ? 'call' : 'rx';
         name = displayName(t.user);
-        sub = `${r.icona} ${r.nome}` + (t.prio && t.origine && !t.eco ? ` · da ${t.origine.icona} ${t.origine.nome}` : '');
+        sub = `${r.icona} ${r.nome}`;
+        if (t.prio) {
+          top = '📡 PARLA LA CENTRALE' + more;
+          sub = t.canali > 1 ? `📡 comunicazione a ${t.canali} canali` : '📡 comunicazione della Centrale';
+        } else if (t.chiamata) {
+          top = `📞 CHIAMATA DA ${t.chiamata.icona} ${t.chiamata.nome}` + more;
+        } else if (t.via) top = `👂 ${t.via.icona} ${t.via.nome}` + more;
+        else top = '▶ IN DIRETTA' + more;
+      } else if (disp.replyTarget()) {
+        const rt = disp.replyTarget();
+        mode = 'idle';
+        top = '↩️ RISPOSTA PRONTA';
+        name = `${rt.icona} ${rt.nome}`;
+        sub = 'tieni premuto e parla: ti sente quel canale';
       } else if (disp.active()) {
         const n = disp.targets().length + 1;
         mode = 'idle';
@@ -2006,9 +2257,10 @@
       $('#meter').style.width = Math.min(100, level * 350).toFixed(1) + '%';
     },
 
-    busy(by, prio) {
+    busy(by, prio, centrale) {
       state.busyBy = by;
       state.busyPrio = !!prio;
+      state.busyCentrale = !!centrale;
       state.busyUntil = Date.now() + 2000;
       $('#ptt').dataset.state = 'busy';
       this.lcd();
@@ -2030,15 +2282,16 @@
         label = 'ATTENDI…';
       } else if (state.tx === 'on' || state.tx === 'stopping') {
         st = 'on';
-        label = hold ? 'IN ONDA<br>rilascia per chiudere' : 'IN ONDA<br>premi per chiudere';
+        const what = state.txMode === 'call' ? 'IN CHIAMATA' : 'IN ONDA';
+        label = what + (hold ? '<br>rilascia per chiudere' : '<br>premi per chiudere');
       } else {
         st = 'idle';
         const n = disp.targets().length + 1;
-        const what = n > 1 ? `PARLA A ${n} CANALI` : 'PER PARLARE';
+        const what = disp.replyTarget() ? 'PER RISPONDERE' : n > 1 ? `PARLA A ${n} CANALI` : 'PER PARLARE';
         label = (hold ? 'TIENI PREMUTO<br>' : 'PREMI<br>') + what;
       }
       if (!(b.dataset.state === 'busy' && st === 'idle' && Date.now() < state.busyUntil)) b.dataset.state = st;
-      b.dataset.multi = disp.targets().length ? '1' : '';
+      b.dataset.multi = disp.targets().length || disp.replyTarget() ? '1' : '';
       $('#pttLabel').innerHTML = label;
       const hint = $('#pttHint');
       hint.textContent = '';
@@ -2062,7 +2315,9 @@
 
     feedItem(m) {
       if (m.tipo === 'sistema') return el('div', 'msg msg-sistema', `${fmtTime(m.ts)} · ${m.testo}`);
-      const mine = isMine(m.from);
+      const mine = !!m.mio || isMine(m.from);
+      // chi lavora in Centrale (permesso o canale Centrale) può prendere in carico e rispondere
+      const inCentrale = disp.allowed() || !!(state.channel && state.channel.sos);
       const lv = m.tipo === 'annuncio' ? ' lv-' + (KINDS[m.livello] ? m.livello : 'info') : '';
       const item = el('div', `msg msg-${m.tipo}${lv}` + (mine ? ' mine' : '') + (m.prio ? ' prio' : '') + (m.via ? ' via' : ''));
       if (m.id) item.dataset.id = m.id;
@@ -2071,8 +2326,10 @@
       const dot = el('span', 'dot');
       dot.style.background = r.colore;
       head.append(dot, el('b', null, displayName(m.from)), el('span', 'rep', `${r.icona} ${r.nome}`));
-      // da dove arriva: un canale ascoltato dalla Centrale, o un messaggio mandato a più canali
-      if (m.via) head.append(el('span', 'tag', `👂 dal canale ${m.via.icona} ${m.via.nome}`));
+      // da dove arriva: chiamata alla Centrale, canale ascoltato dalla Centrale, messaggio a più canali
+      const daCanale = m.chiamata || (m.tipo === 'richiesta' ? m.canale : null);
+      if (daCanale) head.append(el('span', 'tag call', mine ? '📞 alla Centrale' : `📞 da ${daCanale.icona} ${daCanale.nome}`));
+      else if (m.via) head.append(el('span', 'tag', `👂 dal canale ${m.via.icona} ${m.via.nome}`));
       if (m.canali > 1) head.append(el('span', 'tag prio', `📡 a ${m.canali} canali`));
       head.append(el('time', null, fmtTime(m.ts)));
       item.append(head);
@@ -2090,6 +2347,7 @@
         row.append(btn, wave, el('span', 'dur', fmtDur(Math.max(1, m.durata))));
         btn.onclick = () => replayMsg(m, btn);
         item.append(row);
+        if (m.chiamata && !mine && disp.allowed()) item.append(this.callActions(m.chiamata));
       } else if (m.tipo === 'testo') {
         item.append(el('div', 'text', m.testo));
       } else if (m.tipo === 'allerta') {
@@ -2101,15 +2359,40 @@
         item.append(el('div', 'ann-title', K.title.replace(/ 🚨$/, '') + ' · ' + canaliText(m).replace('📡 ', '')));
         item.append(el('div', 'text', m.testo));
         if (m.luogo) item.append(el('div', 'sos-pos', '📍 ' + m.luogo));
+      } else if (m.tipo === 'richiesta') {
+        item.append(el('div', 'ann-title', '📞 RICHIESTA ALLA CENTRALE'));
+        item.append(el('div', 'text', m.testo));
+        if (m.luogo) item.append(el('div', 'sos-pos', '📍 ' + m.luogo));
       }
-      if (m.tipo === 'allerta' || m.tipo === 'annuncio') {
+      if (m.tipo === 'allerta' || m.tipo === 'annuncio' || m.tipo === 'richiesta') {
         item._acks = (m.presoDa || []).map((p) => p.nome);
         const taken = el('div', 'sos-taken');
         taken.hidden = !item._acks.length;
         taken.textContent = '✅ ' + item._acks.join(', ');
         item.append(taken);
       }
+      if (m.tipo === 'richiesta' && !mine && inCentrale) {
+        const acts = disp.allowed() ? this.callActions(m.canale) : el('div', 'msg-actions');
+        const take = el('button', 'btn btn-sm', '✅ Presa in carico');
+        take.type = 'button';
+        take.onclick = () => {
+          net.send({ t: 'richiesta_ack', id: m.id });
+          take.disabled = true;
+        };
+        acts.prepend(take);
+        item.append(acts);
+      }
       return item;
+    },
+
+    /** Pulsante "Rispondi" sotto a una chiamata o a una richiesta (solo per la Centrale) */
+    callActions(canale) {
+      const box = el('div', 'msg-actions');
+      const b = el('button', 'btn btn-sm answer', `↩️ Rispondi a ${canale.icona} ${canale.nome}`);
+      b.type = 'button';
+      b.onclick = () => disp.armReply(canale);
+      box.append(b);
+      return box;
     },
 
     /** Qualcuno ha risposto «Ricevuto» a un SOS o a un comunicato: aggiorna il messaggio in cronologia */
@@ -2123,8 +2406,24 @@
     },
 
     composer() {
-      const n = disp.targets().length + 1;
-      $('#inText').placeholder = n > 1 ? `Scrivi a ${n} canali (Centrale)…` : 'Scrivi un messaggio al canale…';
+      const n = disp.sendIds().length + 1;
+      $('#inText').placeholder = n > 1 ? `Scrivi a ${n} canali (come Centrale)…` : 'Scrivi un messaggio al canale…';
+    },
+
+    // Barra "📞 Parla con la Centrale" (in tutti i canali, tranne quello della Centrale)
+    callBar() {
+      const bar = $('#callBar');
+      const show = state.loggedIn && canCall() && !disp.allowed();
+      bar.hidden = !show;
+      if (!show) return;
+      const c = state.centrale;
+      const calling = state.txMode === 'call' && state.tx !== 'idle';
+      const hold = settings.pttMode === 'hold';
+      $('#btnCall').classList.toggle('on', calling);
+      $('#callTitle').textContent = calling ? 'In chiamata con la Centrale' : 'Parla con la Centrale';
+      const key = settings.callKey && finePointer ? ` · tasto ${keyName(settings.callKey)}` : '';
+      if (calling) $('#callSub').textContent = hold ? 'rilascia per chiudere' : 'premi di nuovo per chiudere';
+      else $('#callSub').textContent = (c.persone ? `🟢 ${c.persone} in ascolto` : "⚪ nessuno in Centrale ora") + ' · ' + (hold ? 'tieni premuto' : 'premi') + key;
     },
 
     feedReset(items) {
@@ -2240,7 +2539,8 @@
     replayBtn = btn;
     btn.textContent = '■';
     btn.classList.add('on');
-    const chId = (m.via && m.via.id) || state.channel.id; // vocale di un canale ascoltato dalla Centrale
+    // vocale di un canale ascoltato dalla Centrale, o la mia chiamata (registrata in Centrale)
+    const chId = (m.via && m.via.id) || (m.chiamata && m.centrale && isMine(m.from) ? m.centrale.id : state.channel.id);
     try {
       await audio.replay(`/api/msg/${encodeURIComponent(chId)}/${m.id}.wav?k=${encodeURIComponent(state.key)}`);
     } catch (e) {
@@ -2310,6 +2610,7 @@
       'Apri il file scaricato «Radio-Udine-RP-Tasto.bat».',
       'Se Windows mostra «PC protetto da Windows», clicca «Ulteriori informazioni» e poi «Esegui comunque».',
       'Nella finestra nera premi il tasto che vuoi usare per parlare (consigliato: un tasto laterale del mouse o un tasto che il gioco non usa).',
+      'Poi ti chiede se vuoi un SECONDO tasto per parlare direttamente con la Centrale: scrivi S e premilo, oppure premi solo INVIO per saltare.',
       'Lascia aperte la finestra nera e questa radio nel browser (anche ridotta a icona).',
       'Ora tieni premuto quel tasto anche dentro al gioco: parli in radio!',
     ]) steps.append(el('li', null, s));
@@ -2427,6 +2728,20 @@
       };
     };
     wrap.append(row('⌨️ Tasto nel browser', keyBtn, 'Funziona solo con questa finestra in primo piano'));
+    if (state.centrale) {
+      const callBtn = el('button', 'btn', settings.callKey ? keyName(settings.callKey) : 'Scegli');
+      callBtn.type = 'button';
+      callBtn.onclick = () => {
+        callBtn.textContent = 'Premi un tasto… (Esc = nessuno)';
+        keyCapture = (code) => {
+          settings.callKey = code && code !== settings.pttKey ? code : '';
+          saveSettings();
+          ui.callBar();
+          callBtn.textContent = settings.callKey ? keyName(settings.callKey) : 'Scegli';
+        };
+      };
+      wrap.append(row('📞 Tasto per chiamare la Centrale', callBtn, 'Tieni premuto questo tasto per parlare con la Centrale da qualsiasi canale'));
+    }
 
     const dl = el('button', 'btn btn-primary', '⬇️ Scarica');
     dl.type = 'button';
@@ -2440,7 +2755,7 @@
         dl.disabled = false;
       }
     };
-    wrap.append(row('🎮 Tasto PTT anche in gioco (Windows)', dl, 'Programmino per parlare tenendo premuto un tasto anche quando sei dentro al gioco'));
+    wrap.append(row('🎮 Tasto PTT anche in gioco (Windows)', dl, 'Programmino per parlare tenendo premuto un tasto anche quando sei dentro al gioco (con un secondo tasto, se vuoi, per chiamare la Centrale)'));
     wrap.append(
       row('Questo browser risponde al tasto PC', check('tastoPc', () => {
         net.send({ t: 'set_remote', on: !!settings.tastoPc });
@@ -2684,27 +2999,64 @@
         return;
       }
       if (e.key === 'Escape' && isTyping(e.target)) e.target.blur();
-      if (!state.loggedIn || e.code !== settings.pttKey || isTyping(e.target)) return;
+      if (!state.loggedIn || isTyping(e.target)) return;
+      const call = !!settings.callKey && e.code === settings.callKey && e.code !== settings.pttKey;
+      if (e.code !== settings.pttKey && !call) return;
       e.preventDefault();
       if (e.repeat) return;
       audio.resume();
       if (!audio.micOk) return showMicHelp();
-      if (settings.pttMode === 'toggle') return ptt.toggle();
-      state.pttSource = 'key';
-      ptt.down();
+      if (settings.pttMode === 'toggle') {
+        if (state.tx === 'idle') ptt.down(call ? 'call' : null);
+        else ptt.up();
+        return;
+      }
+      state.pttSource = call ? 'callkey' : 'key';
+      ptt.down(call ? 'call' : null);
     });
     document.addEventListener('keyup', (e) => {
-      if (e.code !== settings.pttKey || state.pttSource !== 'key') return;
+      const src = e.code === settings.pttKey ? 'key' : settings.callKey && e.code === settings.callKey ? 'callkey' : null;
+      if (!src || state.pttSource !== src) return;
       e.preventDefault();
       state.pttSource = null;
       ptt.up();
     });
     window.addEventListener('blur', () => {
-      if (state.pttSource === 'key') {
+      if (state.pttSource === 'key' || state.pttSource === 'callkey') {
         state.pttSource = null;
         ptt.up();
       }
     });
+
+    // Pulsante "📞 Parla con la Centrale" (tieni premuto, come il pulsante grande)
+    const cb = $('#btnCall');
+    cb.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      audio.resume();
+      if (!audio.micOk) return showMicHelp();
+      if (settings.pttMode === 'toggle') {
+        if (state.tx === 'idle') ptt.down('call');
+        else ptt.up();
+        return;
+      }
+      try {
+        cb.setPointerCapture(e.pointerId);
+      } catch (err) {}
+      state.pttSource = 'call';
+      ptt.down('call');
+    });
+    const callRelease = () => {
+      if (settings.pttMode === 'hold' && state.pttSource === 'call') {
+        state.pttSource = null;
+        ptt.up();
+      }
+    };
+    cb.addEventListener('pointerup', callRelease);
+    cb.addEventListener('pointercancel', callRelease);
+    cb.addEventListener('lostpointercapture', callRelease);
+    cb.addEventListener('contextmenu', (e) => e.preventDefault());
+    $('#btnRequest').onclick = openRequest;
 
     // Altri pulsanti
     $('#btnMenu').onclick = () => ui.openDrawer();
@@ -2738,8 +3090,12 @@
       const text = input.value.trim();
       if (!text) return;
       if (!state.online || !state.channel) return toast('Non sei collegato');
-      const ids = disp.targetIds(); // Centrale con "più canali": il messaggio va a tutti i canali collegati
-      net.send(ids.length ? { t: 'text', text, diramazione: true, canali: ids } : { t: 'text', text });
+      // Centrale ("più canali" o risposta): il messaggio va ai canali collegati, firmato "Centrale"
+      if (disp.sending()) {
+        net.send({ t: 'text', text, diramazione: true, canali: disp.sendIds() });
+        disp.replied();
+        ui.composer();
+      } else net.send({ t: 'text', text });
       input.value = '';
     });
 
